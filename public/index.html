@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2F5D50">
+<title>Ledger — Personal Finance</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ══════════ AUTH SCREEN ══════════ -->
+<div id="auth-screen" class="auth-screen hidden">
+  <div class="auth-card">
+    <div class="wordmark">Ledger</div>
+    <p class="auth-sub">Your personal finance book</p>
+    <form id="auth-form">
+      <label class="field">
+        <span>Email</span>
+        <input type="email" id="auth-email" autocomplete="email" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input type="password" id="auth-password" autocomplete="current-password" minlength="6" required>
+      </label>
+      <div id="auth-error" class="auth-error hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="auth-submit">Sign in</button>
+    </form>
+    <div class="auth-switch">
+      <span id="auth-switch-text">No account yet?</span>
+      <button class="link-btn" id="auth-switch-btn">Create one</button>
+    </div>
+    <button class="link-btn auth-forgot" id="auth-forgot">Forgot password?</button>
+  </div>
+</div>
+
+<!-- ══════════ APP SHELL ══════════ -->
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <div class="wordmark small">Ledger</div>
+    <nav class="tabs desktop-tabs" id="tabs-desktop">
+      <button class="tab active" data-view="overview">Overview</button>
+      <button class="tab" data-view="transactions">Transactions</button>
+      <button class="tab" data-view="recurring">Recurring</button>
+      <button class="tab" data-view="investments">Investments</button>
+      <button class="tab" data-view="settings">Settings</button>
+    </nav>
+    <div class="year-picker">
+      <button class="icon-btn" id="year-prev" aria-label="Previous year">‹</button>
+      <span id="year-label" class="year-label mono">2026</span>
+      <button class="icon-btn" id="year-next" aria-label="Next year">›</button>
+    </div>
+  </header>
+
+  <main id="main" class="main">
+    <div id="view-overview" class="view"></div>
+    <div id="view-transactions" class="view hidden"></div>
+    <div id="view-recurring" class="view hidden"></div>
+    <div id="view-investments" class="view hidden"></div>
+    <div id="view-settings" class="view hidden"></div>
+  </main>
+
+  <button class="fab" id="fab" aria-label="Add transaction">+</button>
+
+  <nav class="tabbar" id="tabs-mobile">
+    <button class="tabbar-btn active" data-view="overview"><span class="tabbar-ico">◫</span>Overview</button>
+    <button class="tabbar-btn" data-view="transactions"><span class="tabbar-ico">≣</span>Entries</button>
+    <button class="tabbar-btn" data-view="recurring"><span class="tabbar-ico">⟳</span>Recurring</button>
+    <button class="tabbar-btn" data-view="investments"><span class="tabbar-ico">◔</span>Invest</button>
+    <button class="tabbar-btn" data-view="settings"><span class="tabbar-ico">⚙</span>Settings</button>
+  </nav>
+
+</div>
+
+<!-- ══════════ TRANSACTION MODAL ══════════ -->
+<div id="tx-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="tx-modal-title">Add entry</h2>
+      <button class="icon-btn" data-close="tx-modal" aria-label="Close">✕</button>
+    </div>
+    <form id="tx-form">
+      <div class="seg" role="tablist">
+        <button type="button" class="seg-btn active" data-txtype="expense">Expense</button>
+        <button type="button" class="seg-btn" data-txtype="income">Income</button>
+      </div>
+      <label class="field">
+        <span>Amount (€)</span>
+        <input type="number" id="tx-amount" step="0.01" min="0.01" inputmode="decimal" required>
+      </label>
+      <label class="field">
+        <span>Date</span>
+        <input type="date" id="tx-date" required>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span>Category</span>
+          <select id="tx-category" required></select>
+        </label>
+        <label class="field">
+          <span>Subcategory</span>
+          <select id="tx-subcategory"></select>
+        </label>
+      </div>
+      <label class="field">
+        <span>Note (optional)</span>
+        <input type="text" id="tx-note" maxlength="120" placeholder="e.g. Mercator weekly shop">
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-danger hidden" id="tx-delete">Delete</button>
+        <div class="spacer"></div>
+        <button type="button" class="btn" data-close="tx-modal">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="tx-save">Save entry</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ══════════ RECURRING MODAL ══════════ -->
+<div id="rec-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="rec-modal-title">Add recurring</h2>
+      <button class="icon-btn" data-close="rec-modal" aria-label="Close">✕</button>
+    </div>
+    <form id="rec-form">
+      <div class="seg" role="tablist">
+        <button type="button" class="seg-btn active" data-rectype="expense">Expense</button>
+        <button type="button" class="seg-btn" data-rectype="income">Income</button>
+      </div>
+      <label class="field">
+        <span>Name</span>
+        <input type="text" id="rec-name" maxlength="60" placeholder="e.g. Rent, Netflix, Gym" required>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span>Amount (€)</span>
+          <input type="number" id="rec-amount" step="0.01" min="0.01" inputmode="decimal" required>
+        </label>
+        <label class="field">
+          <span>Day of month</span>
+          <input type="number" id="rec-day" min="1" max="31" value="1" required>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span>Category</span>
+          <select id="rec-category" required></select>
+        </label>
+        <label class="field">
+          <span>Subcategory</span>
+          <select id="rec-subcategory"></select>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span>Starts</span>
+          <input type="month" id="rec-start" required>
+        </label>
+        <label class="field">
+          <span>Ends (optional)</span>
+          <input type="month" id="rec-end">
+        </label>
+      </div>
+      <p class="hint">Repeats every month on the chosen day, from the start month until the end month (inclusive). Leave “Ends” empty to repeat indefinitely.</p>
+      <div id="rec-overrides" class="ovr-list"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-danger hidden" id="rec-delete">Delete</button>
+        <div class="spacer"></div>
+        <button type="button" class="btn" data-close="rec-modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save recurring</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ══════════ RECURRING OVERRIDE MODAL (one month) ══════════ -->
+<div id="ovr-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="ovr-title">Adjust this month</h2>
+      <button class="icon-btn" data-close="ovr-modal" aria-label="Close">✕</button>
+    </div>
+    <p class="hint" id="ovr-sub" style="margin:-8px 0 14px"></p>
+    <form id="ovr-form">
+      <div class="field-row">
+        <label class="field">
+          <span>Amount for this month (€)</span>
+          <input type="number" id="ovr-amount" step="0.01" min="0.01" inputmode="decimal" required>
+        </label>
+        <label class="field">
+          <span>Day</span>
+          <input type="number" id="ovr-day" min="1" max="31" required>
+        </label>
+      </div>
+      <div class="modal-actions" style="flex-wrap:wrap">
+        <button type="button" class="btn btn-danger btn-sm" id="ovr-skip">Skip this month</button>
+        <button type="button" class="btn btn-sm hidden" id="ovr-reset">Reset to rule</button>
+        <div class="spacer"></div>
+        <button type="button" class="btn btn-sm" id="ovr-edit-rule">Edit rule…</button>
+        <button type="submit" class="btn btn-primary btn-sm">Save month</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ══════════ REVOLUT CSV REVIEW MODAL ══════════ -->
+<div id="rev-modal" class="modal-backdrop hidden">
+  <div class="modal modal-wide">
+    <div class="modal-head">
+      <h2>Review Revolut import</h2>
+      <button class="icon-btn" data-close="rev-modal" aria-label="Close">✕</button>
+    </div>
+    <p class="hint" id="rev-summary" style="margin:-8px 0 12px"></p>
+    <div id="rev-rows" class="rev-rows"></div>
+    <div class="modal-actions">
+      <div class="spacer"></div>
+      <button type="button" class="btn" data-close="rev-modal">Cancel</button>
+      <button type="button" class="btn btn-primary" id="rev-import-btn">Import selected</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="file-excel" accept=".xlsx,.xls" class="hidden">
+<input type="file" id="file-revolut" accept=".csv" class="hidden">
+
+<div id="toast" class="toast hidden"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
