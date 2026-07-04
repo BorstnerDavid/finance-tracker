@@ -16,6 +16,7 @@ A personal finance web app built to replace the `Finance_2026` Excel workbook. H
 - **Excel workbook import** — Settings → Import → choose your `Finance_20xx.xlsx`. Creates one entry per subcategory per month (dated the 15th), and pulls in the starting balance and the Investment sheet. Idempotent: re-importing updates instead of duplicating, and there's a one-click undo.
 - **Revolut statement import (CSV)** — export a statement from the Revolut app, review every transaction in-app (with auto-guessed Slovenian merchant categories: Mercator/Špar → groceries, Petrol → Bencin, Wolt → dostava, …), adjust categories, import. Your category picks are remembered per merchant. Duplicate-proof.
 - **Live Revolut sync (optional)** — connect your Revolut account through GoCardless Bank Account Data (the free EU open-banking API) and pull transactions with one tap. Requires the Cloud Functions setup below.
+- **Projects** — track a one-off big spend (a renovation, a trip, a wedding) as its own project with an optional budget, broken into individual expenses. Each project shows total spent vs. budget; its expenses also roll up into Overview's "Expenses by category" under a Projects row, broken out per project. Each project can optionally carry a planning checklist (item + estimated cost); checking an item off logs it as a real expense for that amount, and unchecking removes it again.
 - Transaction-level tracking with search and month/type filters
 - Income vs expenses bar chart and category donut chart
 - Year-strip: a 12-month mini chart of net savings at the top of Overview
@@ -90,10 +91,12 @@ firebase serve      # or: firebase emulators:start --only hosting
 ```
 users/{uid}/
   transactions/{id}   { type, date "YYYY-MM-DD", amount, category, subcategory, note,
-                        source? "excel" | "revolut" }        // imported entries are tagged
+                        source? "excel" | "revolut" | "project", projectId? }  // imported/project entries are tagged
   recurring/{id}      { type, name, amount, day, category, subcategory,
                         startMonth "YYYY-MM", endMonth "YYYY-MM" | null,
                         overrides?: { "YYYY-MM": {skip:true} | {amount, day} } }
+  projects/{id}       { name, budget: number | null, note, archived,
+                        checklist?: [{ id, name, estimate, expenseId }] }  // optional; checked = expenseId set
   investments/{year}  { months: { "1": {start, invested, pl}, ... } }
   meta/settings       { startingBalance, currency, categories, merchantMap }
   meta/bank           { requisitionId, institutionName, lastSync }   // only with live sync

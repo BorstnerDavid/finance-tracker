@@ -49,16 +49,23 @@ const S = {
   recurring: [],                          // all recurring rules
   settings: { startingBalance: 0, currency: '€', categories: DEFAULT_CATEGORIES },
   investments: {},                        // { "1": {start, invested, pl}, ... } for selected year
+  projects: [],                           // all projects (not year-scoped)
+  projectExpenses: [],                    // all transactions with source:'project', across every year
+  expandedProjects: new Set(),            // project ids currently expanded in the Projects tab (UI-only)
+  checklistOpen: new Set(),               // project ids where the (optional) checklist section is revealed
   txFilter: { type: 'all', search: '' },
-  unsub: { tx: null, rec: null, set: null, inv: null, bank: null },
+  unsub: { tx: null, rec: null, set: null, inv: null, bank: null, proj: null, projExp: null },
   bank: null,                             // { requisitionId, institutionName, ... } when connected
   editingTx: null,
   editingRec: null,
-  loaded: { tx: false, rec: false, set: false },
+  editingProject: null,
+  editingPexp: null,                      // { project, expense|null }
+  loaded: { tx: false, rec: false, set: false, proj: false },
 };
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const cents = (n) => Math.round(Number(n) * 100);
 const sum = (arr) => arr.reduce((a, b) => a + cents(b.amount), 0) / 100;
 
@@ -178,6 +185,15 @@ function subscribeAll() {
     S.bank = snap.exists() ? snap.data() : null;
     if (S.view === 'settings') render();
   });
+  S.unsub.proj = onSnapshot(userCol('projects'), (snap) => {
+    S.projects = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    S.loaded.proj = true;
+    render();
+  });
+  S.unsub.projExp = onSnapshot(query(userCol('transactions'), where('source', '==', 'project')), (snap) => {
+    S.projectExpenses = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    render();
+  });
 }
 
 function subscribeYearData() {
@@ -200,9 +216,11 @@ function subscribeYearData() {
 
 function unsubscribeAll() {
   Object.values(S.unsub).forEach((u) => u?.());
-  S.unsub = { tx: null, rec: null, set: null, inv: null, bank: null };
+  S.unsub = { tx: null, rec: null, set: null, inv: null, bank: null, proj: null, projExp: null };
   S.transactions = []; S.recurring = []; S.investments = {}; S.bank = null;
-  S.loaded = { tx: false, rec: false, set: false };
+  S.projects = []; S.projectExpenses = [];
+  S.expandedProjects = new Set(); S.checklistOpen = new Set();
+  S.loaded = { tx: false, rec: false, set: false, proj: false };
 }
 
 // ─── Recurring expansion ─────────────────────────────────────
@@ -245,15 +263,28 @@ function expandRecurring(year) {
   return out;
 }
 
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 function allEntries() {
-  return [...S.transactions, ...expandRecurring(S.year)];
+  const today = todayStr();
+  return [...S.transactions, ...expandRecurring(S.year)]
+    .filter((e) => e.type !== 'expense' || e.date <= today);
 }
 
 // ─── Aggregation helpers ─────────────────────────────────────
+// Money moved into the "Investment" category is still yours — it's tracked in the
+// Investments tab, so it shouldn't also reduce Expenses/Net savings. Kept informational
+// (visible in Entries) but excluded from every expense sum.
+function countsAsExpense(e) { return e.type === 'expense' && e.category !== 'Investment'; }
+
 function monthlyTotals(entries, type) {
   const totals = Array(12).fill(0);
   for (const e of entries) {
     if (e.type !== type) continue;
+    if (type === 'expense' && !countsAsExpense(e)) continue;
     totals[Number(e.date.slice(5, 7)) - 1] += cents(e.amount);
   }
   return totals.map((c) => c / 100);
@@ -263,18 +294,24 @@ function byCategory(entries, type) {
   const map = {};
   for (const e of entries) {
     if (e.type !== type) continue;
+    if (type === 'expense' && !countsAsExpense(e)) continue;
     const cat = e.category || 'Other';
     if (!map[cat]) map[cat] = { total: 0, months: Array(12).fill(0), subs: {} };
     const m = Number(e.date.slice(5, 7)) - 1;
     map[cat].total += cents(e.amount);
     map[cat].months[m] += cents(e.amount);
     const sub = e.subcategory || '—';
-    map[cat].subs[sub] = (map[cat].subs[sub] || 0) + cents(e.amount);
+    if (!map[cat].subs[sub]) map[cat].subs[sub] = { total: 0, months: Array(12).fill(0) };
+    map[cat].subs[sub].total += cents(e.amount);
+    map[cat].subs[sub].months[m] += cents(e.amount);
   }
   for (const c of Object.values(map)) {
     c.total /= 100;
     c.months = c.months.map((x) => x / 100);
-    for (const k in c.subs) c.subs[k] /= 100;
+    for (const s of Object.values(c.subs)) {
+      s.total /= 100;
+      s.months = s.months.map((x) => x / 100);
+    }
   }
   return map;
 }
@@ -307,19 +344,21 @@ $('year-label').textContent = S.year;
 
 $('fab').addEventListener('click', () => {
   if (S.view === 'recurring') openRecModal();
+  else if (S.view === 'projects') openProjectModal();
   else openTxModal();
 });
 
 // ─── Render root ─────────────────────────────────────────────
 function render() {
   if (!S.user) return;
-  if (!S.loaded.tx || !S.loaded.set || !S.loaded.rec) {
+  if (!S.loaded.tx || !S.loaded.set || !S.loaded.rec || !S.loaded.proj) {
     $(`view-${S.view}`).innerHTML = '<div class="loading">Loading your book…</div>';
     return;
   }
   ({ overview: renderOverview,
      transactions: renderTransactions,
      recurring: renderRecurring,
+     projects: renderProjects,
      investments: renderInvestments,
      settings: renderSettings })[S.view]();
 }
@@ -406,9 +445,9 @@ function categoryTable(cats, monthsEl) {
     const c = cats[n];
     c.months.forEach((v, i) => grand[i] += v);
     html += `<tr class="grp"><td>${esc(n)}</td>${c.months.map((v) => `<td class="mono ${v === 0 ? 'dim' : ''}">${v === 0 ? '—' : fmt0(v)}</td>`).join('')}<td class="mono"><b>${fmt0(c.total)}</b></td><td class="mono">${fmt0(c.total / monthsEl)}</td></tr>`;
-    const subs = Object.entries(c.subs).sort((a, b) => b[1] - a[1]);
+    const subs = Object.entries(c.subs).sort((a, b) => b[1].total - a[1].total);
     for (const [sn, sv] of subs) {
-      html += `<tr><td style="padding-left:24px" class="dim">${esc(sn)}</td><td colspan="12"></td><td class="dim">${fmt0(sv)}</td><td></td></tr>`;
+      html += `<tr><td style="padding-left:24px" class="dim">${esc(sn)}</td>${sv.months.map((v) => `<td class="mono dim">${v === 0 ? '—' : fmt0(v)}</td>`).join('')}<td class="mono dim">${fmt0(sv.total)}</td><td></td></tr>`;
     }
   }
   html += `<tr class="total"><td>Total</td>${grand.map((v) => `<td>${fmt0(v)}</td>`).join('')}<td>${fmt0(grand.reduce((a, b) => a + b, 0))}</td><td>${fmt0(grand.reduce((a, b) => a + b, 0) / monthsEl)}</td></tr>`;
@@ -470,7 +509,7 @@ function renderTransactions() {
   list.sort((a, b) => b.date.localeCompare(a.date));
 
   const totInc = sum(list.filter((e) => e.type === 'income'));
-  const totExp = sum(list.filter((e) => e.type === 'expense'));
+  const totExp = sum(list.filter(countsAsExpense));
 
   // group by date
   const groups = {};
@@ -488,6 +527,7 @@ function renderTransactions() {
           <span class="tx-sub">${esc(e.category)}${e.subcategory ? ' · ' + esc(e.subcategory) : ''}</span>
         </span>
         ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">⟳ ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
+        ${e.source === 'project' ? '<span class="badge">▣ project</span>' : ''}
         <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('');
     return `<div class="day-group"><div class="day-head">${head}</div>${items}</div>`;
@@ -529,7 +569,11 @@ function renderTransactions() {
       if (rule && inst) openOvrModal(rule, inst.monthKey);
     } else {
       const tx = S.transactions.find((t) => t.id === b.dataset.txid);
-      if (tx) openTxModal(tx);
+      if (!tx) return;
+      if (tx.source === 'project') {
+        const p = S.projects.find((pr) => pr.id === tx.projectId);
+        if (p) openPexpModal(p, tx);
+      } else openTxModal(tx);
     }
   });
 }
@@ -578,6 +622,193 @@ function renderRecurring() {
   });
 }
 
+// ═══════════════ PROJECTS ═══════════════
+function projectExpensesFor(id) {
+  return S.projectExpenses.filter((e) => e.projectId === id);
+}
+
+// A checklist item is { id, name, estimate, expenseId }. It's "checked" iff expenseId
+// still resolves to a live expense — so deleting that expense from the Expenses list
+// automatically shows the item as unchecked again, instead of drifting out of sync.
+function clChecked(item) {
+  return !!item.expenseId && S.projectExpenses.some((e) => e.id === item.expenseId);
+}
+
+async function toggleChecklistItem(project, itemId, checked) {
+  const list = project.checklist || [];
+  const idx = list.findIndex((i) => i.id === itemId);
+  if (idx === -1) return;
+  const item = list[idx];
+  const next = [...list];
+  if (checked) {
+    const ref = await addDoc(userCol('transactions'), {
+      type: 'expense',
+      amount: Math.round((Number(item.estimate) || 0) * 100) / 100,
+      date: todayStr(),
+      category: 'Projects',
+      subcategory: project.name,
+      note: item.name,
+      source: 'project',
+      projectId: project.id,
+    });
+    next[idx] = { ...item, expenseId: ref.id };
+  } else {
+    if (item.expenseId) await deleteDoc(userDoc('transactions', item.expenseId)).catch(() => {});
+    next[idx] = { ...item, expenseId: null };
+  }
+  await updateDoc(userDoc('projects', project.id), { checklist: next });
+}
+
+async function addChecklistItem(project, name, estimate) {
+  const item = { id: genId(), name, estimate: Math.round((Number(estimate) || 0) * 100) / 100, expenseId: null };
+  await updateDoc(userDoc('projects', project.id), { checklist: [...(project.checklist || []), item] });
+}
+
+async function deleteChecklistItem(project, itemId) {
+  const item = (project.checklist || []).find((i) => i.id === itemId);
+  if (!item) return;
+  if (clChecked(item) && !confirm('This also deletes the expense it logged. Continue?')) return;
+  if (item.expenseId) await deleteDoc(userDoc('transactions', item.expenseId)).catch(() => {});
+  await updateDoc(userDoc('projects', project.id),
+    { checklist: (project.checklist || []).filter((i) => i.id !== itemId) });
+}
+
+function renderProjects() {
+  const el = $('view-projects');
+  const projects = [...S.projects].sort((a, b) =>
+    (a.archived ? 1 : 0) - (b.archived ? 1 : 0) || a.name.localeCompare(b.name));
+  const activeCount = projects.filter((p) => !p.archived).length;
+  const totalAll = sum(S.projectExpenses);
+
+  const rows = projects.map((p) => {
+    const exps = projectExpensesFor(p.id).sort((a, b) => b.date.localeCompare(a.date));
+    const spent = sum(exps);
+    const pct = p.budget ? Math.min(100, Math.round((spent / p.budget) * 100)) : null;
+    const over = p.budget && spent > p.budget;
+    const expItems = exps.map((e) => `
+      <button class="tx-row expense" data-pexpid="${esc(e.id)}" data-projid="${esc(p.id)}">
+        <span class="tx-dot">↓</span>
+        <span class="tx-main">
+          <span class="tx-title">${esc(e.note || p.name)}</span>
+          <span class="tx-sub">${esc(e.date)}</span>
+        </span>
+        <span class="tx-amt">−${fmt(e.amount).replace('−', '')}</span>
+      </button>`).join('');
+
+    const items = p.checklist || [];
+    const clIsOpen = items.length > 0 || S.checklistOpen.has(p.id);
+    const doneCount = items.filter(clChecked).length;
+    const estTotal = items.reduce((a, i) => a + (Number(i.estimate) || 0), 0);
+    const addRow = `<div class="settings-row cl-add-row">
+      <input type="text" class="cl-name-input" data-projid="${esc(p.id)}" placeholder="Item name" maxlength="60">
+      <input type="number" class="cl-est-input" data-projid="${esc(p.id)}" placeholder="Est. €" step="0.01" min="0">
+      <button type="button" class="btn btn-sm" data-addcl="${esc(p.id)}">+ Add item</button>
+    </div>`;
+    const checklistBlock = clIsOpen ? `
+      <div class="section-title" style="margin-top:0">Checklist <span class="hint" style="margin:0;text-transform:none;font-weight:400">(optional)</span></div>
+      ${items.map((item) => {
+        const checked = clChecked(item);
+        return `<label class="cl-item">
+          <input type="checkbox" data-clid="${esc(item.id)}" data-projid="${esc(p.id)}" ${checked ? 'checked' : ''}>
+          <span class="cl-name ${checked ? 'done' : ''}">${esc(item.name)}</span>
+          <span class="spacer"></span>
+          <span class="mono cl-est">${fmt0(item.estimate)}</span>
+          <button type="button" class="icon-btn" data-delcl="${esc(item.id)}" data-projid="${esc(p.id)}" aria-label="Remove ${esc(item.name)}">✕</button>
+        </label>`;
+      }).join('') || '<p class="hint" style="margin:0 0 8px">Add planned expenses with an estimate — checking one off logs it as a real expense below.</p>'}
+      ${addRow}
+      ${items.length ? `<p class="hint" style="margin:8px 0 0">${doneCount}/${items.length} checked · est. total ${fmt0(estTotal)} ${S.settings.currency}</p>` : ''}
+    ` : `<button type="button" class="btn btn-sm" data-startcl="${esc(p.id)}">+ Add checklist (optional)</button>`;
+
+    return `<div class="card project-card ${p.archived ? 'archived' : ''}">
+      <div class="project-head" data-projtoggle="${esc(p.id)}">
+        <span><b>${esc(p.name)}</b>${p.archived ? ' <span class="badge ended">Done</span>' : ''}</span>
+        <div class="spacer"></div>
+        <span class="mono">${fmt(spent)}${p.budget ? ` / ${fmt0(p.budget)} ${S.settings.currency}` : ''}</span>
+      </div>
+      ${p.budget ? `<div class="proj-bar ${over ? 'over' : ''}"><i style="width:${pct}%"></i></div>` : ''}
+      ${p.note ? `<p class="hint" style="margin-top:8px">${esc(p.note)}</p>` : ''}
+      <div class="proj-expenses ${S.expandedProjects.has(p.id) ? '' : 'hidden'}" id="proj-exp-${esc(p.id)}">
+        ${checklistBlock}
+        <div class="section-title">Expenses</div>
+        ${expItems || '<div class="empty" style="padding:16px">No expenses logged yet.</div>'}
+        <div class="modal-actions" style="flex-wrap:wrap">
+          <button type="button" class="btn btn-sm" data-addexp="${esc(p.id)}">+ Add expense</button>
+          <div class="spacer"></div>
+          <button type="button" class="btn btn-sm" data-editproj="${esc(p.id)}">Edit</button>
+          <button type="button" class="btn btn-sm" data-archproj="${esc(p.id)}">${p.archived ? 'Reopen' : 'Mark done'}</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `
+    <h1>Projects</h1>
+    <div class="stat-grid" style="grid-template-columns:1fr 1fr">
+      <div class="card stat"><div class="lbl">Active projects</div><div class="val mono">${activeCount}</div></div>
+      <div class="card stat"><div class="lbl">Spent all-time</div><div class="val mono">${fmt(totalAll)}</div></div>
+    </div>
+    <div class="section-title">Your projects</div>
+    <div class="card settings-row" style="margin-bottom:14px">
+      <span class="hint" style="margin:0">Track a one-off big spend — a renovation, a trip, a wedding — broken into individual expenses. They also show up in Overview under “Projects”.</span>
+      <div class="spacer"></div>
+      <button type="button" class="btn btn-primary btn-sm" id="new-project">+ New project</button>
+    </div>
+    ${rows || '<div class="empty">No projects yet. Tap “+ New project” to start one.</div>'}
+  `;
+
+  $('new-project').onclick = () => openProjectModal();
+  el.querySelectorAll('[data-projtoggle]').forEach((b) => b.onclick = () => {
+    const id = b.dataset.projtoggle;
+    if (S.expandedProjects.has(id)) S.expandedProjects.delete(id); else S.expandedProjects.add(id);
+    $(`proj-exp-${id}`).classList.toggle('hidden');
+  });
+  el.querySelectorAll('[data-addexp]').forEach((b) => b.onclick = (ev) => {
+    ev.stopPropagation();
+    const p = S.projects.find((pr) => pr.id === b.dataset.addexp);
+    if (p) openPexpModal(p);
+  });
+  el.querySelectorAll('[data-editproj]').forEach((b) => b.onclick = (ev) => {
+    ev.stopPropagation();
+    const p = S.projects.find((pr) => pr.id === b.dataset.editproj);
+    if (p) openProjectModal(p);
+  });
+  el.querySelectorAll('[data-archproj]').forEach((b) => b.onclick = async (ev) => {
+    ev.stopPropagation();
+    const p = S.projects.find((pr) => pr.id === b.dataset.archproj);
+    if (p) await updateDoc(userDoc('projects', p.id), { archived: !p.archived });
+  });
+  el.querySelectorAll('[data-pexpid]').forEach((b) => b.onclick = () => {
+    const p = S.projects.find((pr) => pr.id === b.dataset.projid);
+    const e = S.projectExpenses.find((x) => x.id === b.dataset.pexpid);
+    if (p && e) openPexpModal(p, e);
+  });
+  el.querySelectorAll('[data-startcl]').forEach((b) => b.onclick = (ev) => {
+    ev.stopPropagation();
+    S.checklistOpen.add(b.dataset.startcl);
+    render();
+  });
+  el.querySelectorAll('[data-clid]').forEach((cb) => cb.onchange = async () => {
+    const p = S.projects.find((pr) => pr.id === cb.dataset.projid);
+    if (p) await toggleChecklistItem(p, cb.dataset.clid, cb.checked);
+  });
+  el.querySelectorAll('[data-delcl]').forEach((b) => b.onclick = async (ev) => {
+    ev.stopPropagation();
+    const p = S.projects.find((pr) => pr.id === b.dataset.projid);
+    if (p) await deleteChecklistItem(p, b.dataset.delcl);
+  });
+  el.querySelectorAll('[data-addcl]').forEach((b) => b.onclick = async (ev) => {
+    ev.stopPropagation();
+    const p = S.projects.find((pr) => pr.id === b.dataset.addcl);
+    if (!p) return;
+    const nameInput = el.querySelector(`.cl-name-input[data-projid="${p.id}"]`);
+    const estInput = el.querySelector(`.cl-est-input[data-projid="${p.id}"]`);
+    const name = nameInput.value.trim();
+    if (!name) { toast('Give the item a name'); return; }
+    await addChecklistItem(p, name, estInput.value);
+  });
+}
+
 // ═══════════════ INVESTMENTS ═══════════════
 function renderInvestments() {
   const el = $('view-investments');
@@ -612,7 +843,7 @@ function renderInvestments() {
         </tbody>
       </table>
     </div>
-    <p class="hint" style="margin-top:10px">Values save automatically when you leave a field. Tip: expenses in the “Investment” category also show up in your Overview spending.</p>
+    <p class="hint" style="margin-top:10px">Values save automatically when you leave a field. Tip: entries in the “Investment” category are informational only — they show up in Entries but don't count towards Overview spending or net savings.</p>
   `;
 
   el.querySelectorAll('.inv-in').forEach((input) => {
@@ -711,6 +942,10 @@ function renderSettings() {
       <button class="btn btn-sm" id="export-csv">Export ${S.year} as CSV</button>
       <span class="hint">Includes recurring entries, ready for Excel.</span>
     </div>
+    <div class="card settings-row">
+      <button class="btn btn-sm btn-danger" id="clear-year">Clear ${S.year}…</button>
+      <span class="hint">Deletes every transaction and the Investment tracker for ${S.year}. Recurring rules are kept (edit them in Recurring if needed).</span>
+    </div>
 
     <div class="section-title">Account</div>
     <div class="card settings-row">
@@ -746,6 +981,7 @@ function renderSettings() {
     toast('Category added');
   });
   $('export-csv').onclick = exportCSV;
+  $('clear-year').onclick = clearYear;
   $('sign-out').onclick = () => signOut(auth);
   $('import-excel').onclick = () => $('file-excel').click();
   $('import-revolut').onclick = () => $('file-revolut').click();
@@ -779,6 +1015,20 @@ async function commitBatch(writes) {
     writes.slice(i, i + 400).forEach((w) => b.set(w.ref, w.data));
     await b.commit();
   }
+}
+
+async function clearYear() {
+  const y = S.year;
+  const n = S.transactions.length;
+  if (!n && !Object.keys(S.investments).length) { toast(`${y} is already empty`); return; }
+  if (prompt(`This deletes all ${n} transactions and the Investment tracker for ${y}. This cannot be undone.\n\nType ${y} to confirm:`) !== String(y)) return;
+  for (let i = 0; i < S.transactions.length; i += 400) {
+    const b = writeBatch(db);
+    S.transactions.slice(i, i + 400).forEach((t) => b.delete(userDoc('transactions', t.id)));
+    await b.commit();
+  }
+  if (Object.keys(S.investments).length) await deleteDoc(userDoc('investments', String(y)));
+  toast(`Cleared ${y}`);
 }
 
 async function purgeImports(source) {
@@ -1235,6 +1485,105 @@ $('rec-delete').addEventListener('click', async () => {
   toast('Recurring deleted');
 });
 
+// ═══════════════ PROJECT MODAL ═══════════════
+function openProjectModal(project = null) {
+  S.editingProject = project;
+  $('project-modal-title').textContent = project ? 'Edit project' : 'New project';
+  $('project-delete').classList.toggle('hidden', !project);
+  $('project-name').value = project?.name || '';
+  $('project-budget').value = project?.budget ?? '';
+  $('project-note').value = project?.note || '';
+  $('project-modal').classList.remove('hidden');
+  setTimeout(() => $('project-name').focus(), 50);
+}
+
+$('project-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = $('project-name').value.trim();
+  if (!name) return;
+  const data = {
+    name,
+    budget: $('project-budget').value ? Math.round(Number($('project-budget').value) * 100) / 100 : null,
+    note: $('project-note').value.trim(),
+  };
+  const editing = S.editingProject;
+  try {
+    if (editing) {
+      data.archived = !!editing.archived;
+      await updateDoc(userDoc('projects', editing.id), data);
+      if (editing.name !== name) {
+        const linked = projectExpensesFor(editing.id);
+        for (let i = 0; i < linked.length; i += 400) {
+          const b = writeBatch(db);
+          linked.slice(i, i + 400).forEach((e2) => b.update(userDoc('transactions', e2.id), { subcategory: name }));
+          await b.commit();
+        }
+      }
+    } else {
+      await addDoc(userCol('projects'), { ...data, archived: false });
+    }
+    closeModal('project-modal');
+    toast(editing ? 'Project updated' : 'Project created');
+  } catch { toast('Could not save — check your connection'); }
+});
+
+$('project-delete').addEventListener('click', async () => {
+  if (!S.editingProject) return;
+  const linked = projectExpensesFor(S.editingProject.id);
+  if (!confirm(`Delete “${S.editingProject.name}” and its ${linked.length} expense${linked.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+  for (let i = 0; i < linked.length; i += 400) {
+    const b = writeBatch(db);
+    linked.slice(i, i + 400).forEach((e2) => b.delete(userDoc('transactions', e2.id)));
+    await b.commit();
+  }
+  await deleteDoc(userDoc('projects', S.editingProject.id));
+  closeModal('project-modal');
+  toast('Project deleted');
+});
+
+// ═══════════════ PROJECT EXPENSE MODAL ═══════════════
+function openPexpModal(project, expense = null) {
+  S.editingPexp = { project, expense };
+  $('pexp-modal-title').textContent = expense ? `Edit expense — ${project.name}` : `Add expense — ${project.name}`;
+  $('pexp-delete').classList.toggle('hidden', !expense);
+  $('pexp-amount').value = expense?.amount ?? '';
+  $('pexp-date').value = expense?.date || todayStr();
+  $('pexp-note').value = expense?.note || '';
+  $('pexp-modal').classList.remove('hidden');
+  setTimeout(() => $('pexp-amount').focus(), 50);
+}
+
+$('pexp-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const { project, expense } = S.editingPexp;
+  const data = {
+    type: 'expense',
+    amount: Math.round(Number($('pexp-amount').value) * 100) / 100,
+    date: $('pexp-date').value,
+    category: 'Projects',
+    subcategory: project.name,
+    note: $('pexp-note').value.trim(),
+    source: 'project',
+    projectId: project.id,
+  };
+  if (!data.amount || !data.date) return;
+  try {
+    if (expense) await updateDoc(userDoc('transactions', expense.id), data);
+    else await addDoc(userCol('transactions'), data);
+    closeModal('pexp-modal');
+    toast(expense ? 'Expense updated' : 'Expense added');
+  } catch { toast('Could not save — check your connection'); }
+});
+
+$('pexp-delete').addEventListener('click', async () => {
+  const { expense } = S.editingPexp || {};
+  if (!expense) return;
+  if (!confirm('Delete this expense?')) return;
+  await deleteDoc(userDoc('transactions', expense.id));
+  closeModal('pexp-modal');
+  toast('Expense deleted');
+});
+
 // ═══════════════ PER-MONTH OVERRIDE MODAL ═══════════════
 let ovrCtx = null; // { rule, monthKey }
 
@@ -1285,11 +1634,14 @@ $('ovr-edit-rule').addEventListener('click', () => {
 });
 
 // ─── Modal plumbing ──────────────────────────────────────────
-function closeModal(id) { $(id).classList.add('hidden'); S.editingTx = null; S.editingRec = null; }
+function closeModal(id) {
+  $(id).classList.add('hidden');
+  S.editingTx = null; S.editingRec = null; S.editingProject = null; S.editingPexp = null;
+}
 document.querySelectorAll('[data-close]').forEach((b) =>
   b.addEventListener('click', () => closeModal(b.dataset.close)));
 document.querySelectorAll('.modal-backdrop').forEach((bd) =>
   bd.addEventListener('click', (e) => { if (e.target === bd) closeModal(bd.id); }));
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') ['tx-modal', 'rec-modal', 'ovr-modal', 'rev-modal'].forEach(closeModal);
+  if (e.key === 'Escape') ['tx-modal', 'rec-modal', 'ovr-modal', 'rev-modal', 'project-modal', 'pexp-modal'].forEach(closeModal);
 });

@@ -46,6 +46,7 @@
       <button class="tab active" data-view="overview">Overview</button>
       <button class="tab" data-view="transactions">Transactions</button>
       <button class="tab" data-view="recurring">Recurring</button>
+      <button class="tab" data-view="projects">Projects</button>
       <button class="tab" data-view="investments">Investments</button>
       <button class="tab" data-view="settings">Settings</button>
     </nav>
@@ -60,6 +61,7 @@
     <div id="view-overview" class="view"></div>
     <div id="view-transactions" class="view hidden"></div>
     <div id="view-recurring" class="view hidden"></div>
+    <div id="view-projects" class="view hidden"></div>
     <div id="view-investments" class="view hidden"></div>
     <div id="view-settings" class="view hidden"></div>
   </main>
@@ -70,6 +72,7 @@
     <button class="tabbar-btn active" data-view="overview"><span class="tabbar-ico">◫</span>Overview</button>
     <button class="tabbar-btn" data-view="transactions"><span class="tabbar-ico">≣</span>Entries</button>
     <button class="tabbar-btn" data-view="recurring"><span class="tabbar-ico">⟳</span>Recurring</button>
+    <button class="tabbar-btn" data-view="projects"><span class="tabbar-ico">▣</span>Projects</button>
     <button class="tabbar-btn" data-view="investments"><span class="tabbar-ico">◔</span>Invest</button>
     <button class="tabbar-btn" data-view="settings"><span class="tabbar-ico">⚙</span>Settings</button>
   </nav>
@@ -203,6 +206,68 @@
         <div class="spacer"></div>
         <button type="button" class="btn btn-sm" id="ovr-edit-rule">Edit rule…</button>
         <button type="submit" class="btn btn-primary btn-sm">Save month</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ══════════ PROJECT MODAL ══════════ -->
+<div id="project-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="project-modal-title">New project</h2>
+      <button class="icon-btn" data-close="project-modal" aria-label="Close">✕</button>
+    </div>
+    <form id="project-form">
+      <label class="field">
+        <span>Name</span>
+        <input type="text" id="project-name" maxlength="60" placeholder="e.g. Kitchen remodel, Wedding, New car" required>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span>Budget (€, optional)</span>
+          <input type="number" id="project-budget" step="0.01" min="0" inputmode="decimal">
+        </label>
+      </div>
+      <label class="field">
+        <span>Note (optional)</span>
+        <input type="text" id="project-note" maxlength="140">
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-danger hidden" id="project-delete">Delete</button>
+        <div class="spacer"></div>
+        <button type="button" class="btn" data-close="project-modal">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="project-save">Save project</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ══════════ PROJECT EXPENSE MODAL ══════════ -->
+<div id="pexp-modal" class="modal-backdrop hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="pexp-modal-title">Add expense</h2>
+      <button class="icon-btn" data-close="pexp-modal" aria-label="Close">✕</button>
+    </div>
+    <form id="pexp-form">
+      <label class="field">
+        <span>Amount (€)</span>
+        <input type="number" id="pexp-amount" step="0.01" min="0.01" inputmode="decimal" required>
+      </label>
+      <label class="field">
+        <span>Date</span>
+        <input type="date" id="pexp-date" required>
+      </label>
+      <label class="field">
+        <span>Note (optional)</span>
+        <input type="text" id="pexp-note" maxlength="120" placeholder="e.g. Cabinets deposit">
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-danger hidden" id="pexp-delete">Delete</button>
+        <div class="spacer"></div>
+        <button type="button" class="btn" data-close="pexp-modal">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save expense</button>
       </div>
     </form>
   </div>
