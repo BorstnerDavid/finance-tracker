@@ -78,8 +78,7 @@ input, select { font-family: inherit; font-size: 15px; }
   font-size: 13px;
   margin-bottom: 12px;
 }
-.auth-switch { margin-top: 18px; font-size: 14px; color: var(--ink-soft); }
-.auth-forgot { margin-top: 8px; font-size: 13px; }
+.auth-forgot { margin-top: 18px; font-size: 13px; }
 .link-btn {
   background: none; border: none; padding: 0;
   color: var(--pine); font-size: inherit;

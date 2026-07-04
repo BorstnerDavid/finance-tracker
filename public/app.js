@@ -4,8 +4,8 @@
 import { firebaseConfig } from './firebase-config.js';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
 import {
-  getAuth, onAuthStateChanged, signInWithEmailAndPassword,
-  createUserWithEmailAndPassword, sendPasswordResetEmail, signOut
+  getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged,
+  signInWithEmailAndPassword, sendPasswordResetEmail, signOut
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc,
@@ -17,6 +17,10 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const fns = getFunctions(app, 'europe-west1');
+// Keep the session in the browser's local storage so signing in once is enough
+// across restarts/reloads — auth-state restoration otherwise defaults to being
+// tied to the current tab and can get dropped between visits.
+setPersistence(auth, browserLocalPersistence).catch((ex) => console.error('Auth persistence:', ex));
 
 // ─── Default categories (seeded from the 2026 Excel) ────────
 const DEFAULT_CATEGORIES = {
@@ -88,8 +92,6 @@ function toast(msg) {
 }
 
 // ─── Auth ────────────────────────────────────────────────────
-let authMode = 'signin';
-
 onAuthStateChanged(auth, (user) => {
   S.user = user;
   if (user) {
@@ -111,22 +113,13 @@ $('auth-form').addEventListener('submit', async (e) => {
   err.classList.add('hidden');
   $('auth-submit').disabled = true;
   try {
-    if (authMode === 'signin') await signInWithEmailAndPassword(auth, email, pass);
-    else await createUserWithEmailAndPassword(auth, email, pass);
+    await signInWithEmailAndPassword(auth, email, pass);
   } catch (ex) {
     err.textContent = friendlyAuthError(ex.code);
     err.classList.remove('hidden');
   } finally {
     $('auth-submit').disabled = false;
   }
-});
-
-$('auth-switch-btn').addEventListener('click', () => {
-  authMode = authMode === 'signin' ? 'signup' : 'signin';
-  $('auth-submit').textContent = authMode === 'signin' ? 'Sign in' : 'Create account';
-  $('auth-switch-text').textContent = authMode === 'signin' ? 'No account yet?' : 'Already have an account?';
-  $('auth-switch-btn').textContent = authMode === 'signin' ? 'Create one' : 'Sign in';
-  $('auth-password').autocomplete = authMode === 'signin' ? 'current-password' : 'new-password';
 });
 
 $('auth-forgot').addEventListener('click', async () => {
@@ -145,8 +138,6 @@ function friendlyAuthError(code) {
     'auth/invalid-credential': 'Wrong email or password.',
     'auth/user-not-found': 'No account with that email.',
     'auth/wrong-password': 'Wrong email or password.',
-    'auth/email-already-in-use': 'An account with that email already exists.',
-    'auth/weak-password': 'Password must be at least 6 characters.',
     'auth/invalid-email': 'That email address looks invalid.',
     'auth/too-many-requests': 'Too many attempts — try again in a minute.',
   };

@@ -56,7 +56,7 @@ firebase deploy --only hosting,firestore
 Your app is live at `https://<project-id>.web.app`. (The plain `firebase deploy` also tries to deploy the optional bank-sync functions — skip that until you've done the section below, or leave it out forever; everything else works without it.)
 
 ### 5. First run
-Open the URL, tap **Create one** to register your email + password, then:
+There's no self-service sign-up screen (by design — this is a single-user book, not a public app). Create your account once in the console: **Build → Authentication → Users → Add user**, enter your email + a password. Then open the URL and sign in with those credentials:
 1. Settings → set your **starting balance** — or skip this and just import the Excel, which sets it for you.
 2. Settings → Import → **Choose .xlsx** and pick `Finance_2026_David.xlsx`.
 3. Recurring → add your fixed monthly items (rent, subscriptions, salary as recurring *income*).
