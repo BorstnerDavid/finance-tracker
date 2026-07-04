@@ -9,7 +9,8 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc,
-  onSnapshot, query, where, writeBatch, deleteField
+  onSnapshot, query, where, writeBatch, deleteField, getDoc, getDocs,
+  arrayUnion, arrayRemove
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getFunctions, httpsCallable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js';
 
@@ -43,6 +44,10 @@ const DEFAULT_CATEGORIES = {
 const CAT_COLORS = ['#2F5D50', '#C98A2D', '#B0492F', '#5B7FA6', '#8A6FA8', '#6E8B5E', '#C2607E', '#7A6A55', '#4A8B8B', '#A8842F'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+// Small inline "house" glyph for Household — the ⌂ Unicode character renders
+// inconsistently (missing/mismatched across fonts), so draw a matching line icon instead.
+const houseIcon = (size = 13) => `<svg class="ico-house" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-9.5"/><path d="M10 21v-6h4v6"/></svg>`;
+
 // ─── State ───────────────────────────────────────────────────
 const S = {
   user: null,
@@ -57,14 +62,24 @@ const S = {
   projectExpenses: [],                    // all transactions with source:'project', across every year
   expandedProjects: new Set(),            // project ids currently expanded in the Projects tab (UI-only)
   checklistOpen: new Set(),               // project ids where the (optional) checklist section is revealed
+  household: null,                        // { id, name, ownerUid, members: [uid], memberNames: {uid:email} } | null
+  householdTransactions: [],              // shared entries for the selected year
+  householdRecurring: [],                 // shared recurring rules
+  householdProjects: [],                  // shared projects
+  householdProjectExpenses: [],           // shared project expenses, across every year
+  loans: [],                              // lending reminders (personal only): { direction, person, amount, date, dueDate, note, settled }
   txFilter: { type: 'all', search: '' },
-  unsub: { tx: null, rec: null, set: null, inv: null, bank: null, proj: null, projExp: null },
+  unsub: {
+    tx: null, rec: null, set: null, inv: null, bank: null, proj: null, projExp: null,
+    household: null, hhTx: null, hhRec: null, hhProj: null, hhProjExp: null, loans: null,
+  },
   bank: null,                             // { requisitionId, institutionName, ... } when connected
   editingTx: null,
   editingRec: null,
   editingProject: null,
   editingPexp: null,                      // { project, expense|null }
-  loaded: { tx: false, rec: false, set: false, proj: false },
+  editingLoan: null,
+  loaded: { tx: false, rec: false, set: false, proj: false, household: false, loans: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -147,11 +162,16 @@ function friendlyAuthError(code) {
 // ─── Firestore subscriptions ─────────────────────────────────
 function userCol(name) { return collection(db, 'users', S.user.uid, name); }
 function userDoc(...path) { return doc(db, 'users', S.user.uid, ...path); }
+function householdCol(name) { return collection(db, 'households', S.household.id, name); }
+function householdDoc(...path) { return doc(db, 'households', S.household.id, ...path); }
+// Route a read/write at the right pool depending on an item's own `scope` tag.
+function scopedCol(scope, name) { return scope === 'household' ? householdCol(name) : userCol(name); }
+function scopedDoc(scope, ...path) { return scope === 'household' ? householdDoc(...path) : userDoc(...path); }
 
 function subscribeAll() {
   subscribeYearData();
   S.unsub.rec = onSnapshot(userCol('recurring'), (snap) => {
-    S.recurring = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    S.recurring = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'personal' }));
     S.loaded.rec = true;
     render();
   });
@@ -177,12 +197,28 @@ function subscribeAll() {
     if (S.view === 'settings') render();
   });
   S.unsub.proj = onSnapshot(userCol('projects'), (snap) => {
-    S.projects = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    S.projects = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'personal' }));
     S.loaded.proj = true;
     render();
   });
   S.unsub.projExp = onSnapshot(query(userCol('transactions'), where('source', '==', 'project')), (snap) => {
-    S.projectExpenses = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    S.projectExpenses = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'personal' }));
+    render();
+  });
+  S.unsub.household = onSnapshot(
+    query(collection(db, 'households'), where('members', 'array-contains', S.user.uid)),
+    (snap) => {
+      const d = snap.docs[0];
+      const next = d ? { id: d.id, ...d.data() } : null;
+      const changed = (S.household?.id || null) !== (next?.id || null);
+      S.household = next;
+      S.loaded.household = true;
+      if (changed) { subscribeHouseholdData(); subscribeYearData(); }
+      render();
+    });
+  S.unsub.loans = onSnapshot(userCol('loans'), (snap) => {
+    S.loans = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
+    S.loaded.loans = true;
     render();
   });
 }
@@ -190,12 +226,13 @@ function subscribeAll() {
 function subscribeYearData() {
   S.unsub.tx?.();
   S.unsub.inv?.();
+  S.unsub.hhTx?.();
   S.loaded.tx = false;
   const y = S.year;
   const q = query(userCol('transactions'),
     where('date', '>=', `${y}-01-01`), where('date', '<=', `${y}-12-31`));
   S.unsub.tx = onSnapshot(q, (snap) => {
-    S.transactions = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    S.transactions = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'personal' }));
     S.loaded.tx = true;
     render();
   });
@@ -203,15 +240,54 @@ function subscribeYearData() {
     S.investments = snap.exists() ? (snap.data().months || {}) : {};
     render();
   });
+  if (S.household) {
+    const hq = query(householdCol('transactions'),
+      where('date', '>=', `${y}-01-01`), where('date', '<=', `${y}-12-31`));
+    S.unsub.hhTx = onSnapshot(hq, (snap) => {
+      S.householdTransactions = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'household' }));
+      render();
+    });
+  } else {
+    S.householdTransactions = [];
+  }
+}
+
+// Non-year-scoped shared collections (recurring rules, projects, project expenses) —
+// re-subscribed whenever household membership changes (joining, leaving, or first load).
+function subscribeHouseholdData() {
+  S.unsub.hhRec?.(); S.unsub.hhProj?.(); S.unsub.hhProjExp?.();
+  S.unsub.hhRec = S.unsub.hhProj = S.unsub.hhProjExp = null;
+  if (!S.household) {
+    S.householdRecurring = []; S.householdProjects = []; S.householdProjectExpenses = [];
+    return;
+  }
+  S.unsub.hhRec = onSnapshot(householdCol('recurring'), (snap) => {
+    S.householdRecurring = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'household' }));
+    render();
+  });
+  S.unsub.hhProj = onSnapshot(householdCol('projects'), (snap) => {
+    S.householdProjects = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'household' }));
+    render();
+  });
+  S.unsub.hhProjExp = onSnapshot(query(householdCol('transactions'), where('source', '==', 'project')), (snap) => {
+    S.householdProjectExpenses = snap.docs.map((d) => ({ ...d.data(), id: d.id, scope: 'household' }));
+    render();
+  });
 }
 
 function unsubscribeAll() {
   Object.values(S.unsub).forEach((u) => u?.());
-  S.unsub = { tx: null, rec: null, set: null, inv: null, bank: null, proj: null, projExp: null };
+  S.unsub = {
+    tx: null, rec: null, set: null, inv: null, bank: null, proj: null, projExp: null,
+    household: null, hhTx: null, hhRec: null, hhProj: null, hhProjExp: null, loans: null,
+  };
   S.transactions = []; S.recurring = []; S.investments = {}; S.bank = null;
   S.projects = []; S.projectExpenses = [];
   S.expandedProjects = new Set(); S.checklistOpen = new Set();
-  S.loaded = { tx: false, rec: false, set: false, proj: false };
+  S.household = null; S.householdTransactions = []; S.householdRecurring = [];
+  S.householdProjects = []; S.householdProjectExpenses = [];
+  S.loans = [];
+  S.loaded = { tx: false, rec: false, set: false, proj: false, household: false, loans: false };
 }
 
 // ─── Recurring expansion ─────────────────────────────────────
@@ -226,9 +302,9 @@ function ruleActiveIn(rule, y, m0) {
   return true;
 }
 
-function expandRecurring(year) {
+function expandRecurring(year, rules = S.recurring) {
   const out = [];
-  for (const r of S.recurring) {
+  for (const r of rules) {
     for (let m = 0; m < 12; m++) {
       if (!ruleActiveIn(r, year, m)) continue;
       const key = `${year}-${String(m + 1).padStart(2, '0')}`;
@@ -242,6 +318,8 @@ function expandRecurring(year) {
         monthKey: key,
         virtual: true,
         adjusted: !!ovr,
+        scope: r.scope,
+        addedBy: r.addedBy,
         type: r.type,
         amount: ovr?.amount ?? r.amount,
         category: r.category,
@@ -261,8 +339,12 @@ function todayStr() {
 
 function allEntries() {
   const today = todayStr();
-  return [...S.transactions, ...expandRecurring(S.year)]
-    .filter((e) => e.type !== 'expense' || e.date <= today);
+  return [
+    ...S.transactions,
+    ...S.householdTransactions,
+    ...expandRecurring(S.year, S.recurring),
+    ...expandRecurring(S.year, S.householdRecurring),
+  ].filter((e) => e.type !== 'expense' || e.date <= today);
 }
 
 // ─── Aggregation helpers ─────────────────────────────────────
@@ -307,6 +389,25 @@ function byCategory(entries, type) {
   return map;
 }
 
+// Same {total, months} shape as byCategory, but grouped by household project name —
+// used to render household projects as their own grid, separate from personal categories.
+function byHouseholdProject(entries) {
+  const map = {};
+  for (const e of entries) {
+    if (e.type !== 'expense' || e.category !== 'Projects' || e.scope !== 'household') continue;
+    const name = e.subcategory || 'Other';
+    if (!map[name]) map[name] = { total: 0, months: Array(12).fill(0), subs: {} };
+    const m = Number(e.date.slice(5, 7)) - 1;
+    map[name].total += cents(e.amount);
+    map[name].months[m] += cents(e.amount);
+  }
+  for (const c of Object.values(map)) {
+    c.total /= 100;
+    c.months = c.months.map((x) => x / 100);
+  }
+  return map;
+}
+
 function monthsElapsed() {
   const now = new Date();
   if (S.year < now.getFullYear()) return 12;
@@ -321,7 +422,7 @@ function setView(v) {
     b.classList.toggle('active', b.dataset.view === v));
   document.querySelectorAll('.view').forEach((el) =>
     el.classList.toggle('hidden', el.id !== `view-${v}`));
-  $('fab').classList.toggle('hidden', v === 'settings' || v === 'investments');
+  $('fab').classList.toggle('hidden', v === 'settings' || v === 'investments' || v === 'household');
   render();
   window.scrollTo({ top: 0 });
 }
@@ -336,13 +437,14 @@ $('year-label').textContent = S.year;
 $('fab').addEventListener('click', () => {
   if (S.view === 'recurring') openRecModal();
   else if (S.view === 'projects') openProjectModal();
+  else if (S.view === 'lending') openLoanModal();
   else openTxModal();
 });
 
 // ─── Render root ─────────────────────────────────────────────
 function render() {
   if (!S.user) return;
-  if (!S.loaded.tx || !S.loaded.set || !S.loaded.rec || !S.loaded.proj) {
+  if (!S.loaded.tx || !S.loaded.set || !S.loaded.rec || !S.loaded.proj || !S.loaded.household || !S.loaded.loans) {
     $(`view-${S.view}`).innerHTML = '<div class="loading">Loading your book…</div>';
     return;
   }
@@ -350,6 +452,8 @@ function render() {
      transactions: renderTransactions,
      recurring: renderRecurring,
      projects: renderProjects,
+     household: renderHousehold,
+     lending: renderLending,
      investments: renderInvestments,
      settings: renderSettings })[S.view]();
 }
@@ -380,7 +484,12 @@ function renderOverview() {
       <div class="bar"><i style="height:${h}px"></i></div><div class="m">${m}</div></div>`;
   }).join('');
 
-  const expCats = byCategory(entries, 'expense');
+  // The donut/total figures always reflect every expense combined (personal + household
+  // projects); the detailed breakdown table below splits household projects into their
+  // own grid, so "Expenses by category" doesn't mix two people's project spending together.
+  const expCatsAll = byCategory(entries, 'expense');
+  const expCatsTable = byCategory(entries.filter((e) => !(e.category === 'Projects' && e.scope === 'household')), 'expense');
+  const hhProjCats = S.household ? byHouseholdProject(entries) : {};
 
   el.innerHTML = `
     <h1>${S.year} at a glance</h1>
@@ -401,44 +510,81 @@ function renderOverview() {
           <span class="li"><span class="sw" style="background:var(--pine)"></span>Expenses</span>
         </div>
       </div>
-      <div class="card chart-card"><h3>Spending by category</h3>${donutChart(expCats)}</div>
+      <div class="card chart-card"><h3>Spending by category</h3>${donutChart(expCatsAll)}</div>
     </div>
 
     <div class="section-title">Monthly summary</div>
     <div class="card table-wrap">${summaryTable(inc, exp, net, ending)}</div>
 
     <div class="section-title">Expenses by category</div>
-    <div class="card table-wrap">${categoryTable(expCats, me)}</div>
+    <p class="hint" style="margin:-10px 0 10px">Tap any amount to see the transactions behind it.</p>
+    <div class="card table-wrap">${categoryTable(expCatsTable, me)}</div>
+
+    ${S.household && Object.keys(hhProjCats).length ? `
+      <div class="section-title">${houseIcon(14)} Household projects</div>
+      <div class="card table-wrap">${categoryTable(hhProjCats, me, 'hhproj')}</div>
+    ` : ''}
   `;
+
+  el.onclick = (ev) => {
+    const td = ev.target.closest('td[data-kind]');
+    if (!td) return;
+    const month = td.dataset.month === 'total' ? null : Number(td.dataset.month);
+    const inMonth = (e) => month == null || Number(e.date.slice(5, 7)) - 1 === month;
+    let list, title;
+    if (td.dataset.kind === 'cat') {
+      const cat = td.dataset.cat, sub = td.dataset.sub || null;
+      list = entries.filter((e) => e.type === 'expense' && countsAsExpense(e) &&
+        (e.category || 'Other') === cat && (sub == null || (e.subcategory || '—') === sub) && inMonth(e));
+      title = `${cat}${sub ? ' · ' + sub : ''}${month != null ? ' · ' + MONTHS[month] : ''}`;
+    } else if (td.dataset.kind === 'hhproj') {
+      const proj = td.dataset.proj;
+      list = entries.filter((e) => e.type === 'expense' && e.category === 'Projects' && e.scope === 'household' &&
+        (e.subcategory || 'Other') === proj && inMonth(e));
+      title = `Household · ${proj}${month != null ? ' · ' + MONTHS[month] : ''}`;
+    } else if (td.dataset.kind === 'type') {
+      const type = td.dataset.type;
+      list = entries.filter((e) => e.type === type && (type !== 'expense' || countsAsExpense(e)) && inMonth(e));
+      title = `${type === 'income' ? 'Income' : 'Expenses'}${month != null ? ' · ' + MONTHS[month] : ''}`;
+    }
+    if (list) openDetailsModal(title, list);
+  };
 }
 
 function summaryTable(inc, exp, net, ending) {
-  const row = (label, arr, cls = '', signed = false) => `<tr>
+  const row = (label, arr, cls = '', signed = false, type = null) => `<tr>
     <td>${label}</td>
-    ${arr.map((v) => `<td class="${v === 0 ? 'dim' : ''} ${cls && v !== 0 ? (v > 0 ? 'pos' : 'neg') : ''}">${v === 0 && !signed ? '—' : fmt0(v)}</td>`).join('')}
-    <td><b>${fmt0(arr.reduce((a, b) => a + b, 0))}</b></td></tr>`;
+    ${arr.map((v, i) => {
+      const click = type && v !== 0;
+      return `<td class="${v === 0 ? 'dim' : ''} ${click ? 'clickable' : ''} ${cls && v !== 0 ? (v > 0 ? 'pos' : 'neg') : ''}" ${click ? `data-kind="type" data-type="${type}" data-month="${i}"` : ''}>${v === 0 && !signed ? '—' : fmt0(v)}</td>`;
+    }).join('')}
+    <td ${type ? `class="clickable" data-kind="type" data-type="${type}" data-month="total"` : ''}><b>${fmt0(arr.reduce((a, b) => a + b, 0))}</b></td></tr>`;
   return `<table class="ledger">
     <thead><tr><th></th>${MONTHS.map((m) => `<th>${m}</th>`).join('')}<th>Total</th></tr></thead>
     <tbody>
-      ${row('Income', inc)}
-      ${row('Expenses', exp)}
+      ${row('Income', inc, '', false, 'income')}
+      ${row('Expenses', exp, '', false, 'expense')}
       ${row('Net savings', net, 'signed', true)}
       <tr class="total"><td>Ending balance</td>${ending.map((v) => `<td>${fmt0(v)}</td>`).join('')}<td></td></tr>
     </tbody></table>`;
 }
 
-function categoryTable(cats, monthsEl) {
+function categoryTable(cats, monthsEl, kind = 'cat') {
   const names = Object.keys(cats).sort((a, b) => cats[b].total - cats[a].total);
   if (!names.length) return '<div class="empty">No expenses yet this year. Add your first entry with the + button.</div>';
-  let html = `<table class="ledger"><thead><tr><th>Category</th>${MONTHS.map((m) => `<th>${m}</th>`).join('')}<th>Total</th><th>Avg/mo</th></tr></thead><tbody>`;
+  let html = `<table class="ledger"><thead><tr><th>${kind === 'hhproj' ? 'Project' : 'Category'}</th>${MONTHS.map((m) => `<th>${m}</th>`).join('')}<th>Total</th><th>Avg/mo</th></tr></thead><tbody>`;
   let grand = Array(12).fill(0);
   for (const n of names) {
     const c = cats[n];
     c.months.forEach((v, i) => grand[i] += v);
-    html += `<tr class="grp"><td>${esc(n)}</td>${c.months.map((v) => `<td class="mono ${v === 0 ? 'dim' : ''}">${v === 0 ? '—' : fmt0(v)}</td>`).join('')}<td class="mono"><b>${fmt0(c.total)}</b></td><td class="mono">${fmt0(c.total / monthsEl)}</td></tr>`;
-    const subs = Object.entries(c.subs).sort((a, b) => b[1].total - a[1].total);
-    for (const [sn, sv] of subs) {
-      html += `<tr><td style="padding-left:24px" class="dim">${esc(sn)}</td>${sv.months.map((v) => `<td class="mono dim">${v === 0 ? '—' : fmt0(v)}</td>`).join('')}<td class="mono dim">${fmt0(sv.total)}</td><td></td></tr>`;
+    const attr = (v, month) => v === 0 ? '' : (kind === 'hhproj' ? `data-kind="hhproj" data-proj="${esc(n)}" data-month="${month}"` : `data-kind="cat" data-cat="${esc(n)}" data-month="${month}"`);
+    html += `<tr class="grp"><td>${esc(n)}</td>${c.months.map((v, i) => `<td class="mono ${v === 0 ? 'dim' : 'clickable'}" ${attr(v, i)}>${v === 0 ? '—' : fmt0(v)}</td>`).join('')}<td class="mono clickable" ${attr(c.total, 'total')}><b>${fmt0(c.total)}</b></td><td class="mono">${fmt0(c.total / monthsEl)}</td></tr>`;
+    if (kind !== 'hhproj') {
+      const subs = Object.entries(c.subs).sort((a, b) => b[1].total - a[1].total);
+      for (const [sn, sv] of subs) {
+        const subAttr = (v, month) => v === 0 ? '' : `data-kind="cat" data-cat="${esc(n)}" data-sub="${esc(sn)}" data-month="${month}"`;
+        html += `<tr><td style="padding-left:24px" class="dim">${esc(sn)}</td>${sv.months.map((v, i) => `<td class="mono dim ${v !== 0 ? 'clickable' : ''}" ${subAttr(v, i)}>${v === 0 ? '—' : fmt0(v)}</td>`).join('')}<td class="mono dim clickable" ${subAttr(sv.total, 'total')}>${fmt0(sv.total)}</td><td></td></tr>`;
+      }
     }
   }
   html += `<tr class="total"><td>Total</td>${grand.map((v) => `<td>${fmt0(v)}</td>`).join('')}<td>${fmt0(grand.reduce((a, b) => a + b, 0))}</td><td>${fmt0(grand.reduce((a, b) => a + b, 0) / monthsEl)}</td></tr>`;
@@ -486,6 +632,54 @@ function donutChart(cats) {
     <div class="legend">${legend}</div>`;
 }
 
+function memberLabel(uid) {
+  if (uid === S.user.uid) return 'you';
+  return S.household?.memberNames?.[uid] || 'a member';
+}
+
+// Routes a single entry (virtual recurring instance, project expense, or plain
+// transaction) to whichever modal knows how to edit it — shared by the Entries
+// list and the Overview "details" popup so both open the same editor.
+function openEntryModal(e) {
+  if (e.virtual) {
+    const rule = (e.scope === 'household' ? S.householdRecurring : S.recurring).find((r) => r.id === e.recurringId);
+    if (rule) openOvrModal(rule, e.monthKey);
+    return;
+  }
+  if (e.source === 'project') {
+    const p = findProject(e.scope, e.projectId);
+    if (p) openPexpModal(p, e);
+    return;
+  }
+  openTxModal(e);
+}
+
+function openDetailsModal(title, list) {
+  const sorted = [...list].sort((a, b) => b.date.localeCompare(a.date));
+  const total = sum(sorted);
+  $('details-title').textContent = title;
+  $('details-body').innerHTML = `
+    <p class="hint" style="margin:-4px 0 14px">${sorted.length} entr${sorted.length === 1 ? 'y' : 'ies'} · total ${fmt(total)}</p>
+    ${sorted.map((e) => `
+      <button class="tx-row ${e.type}" data-txid="${esc(e.id)}">
+        <span class="tx-dot">${e.type === 'income' ? '↑' : '↓'}</span>
+        <span class="tx-main">
+          <span class="tx-title">${esc(e.note || e.subcategory || e.category)}</span>
+          <span class="tx-sub">${esc(e.date)}${e.subcategory ? ' · ' + esc(e.subcategory) : ''}</span>
+        </span>
+        ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">⟳ ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
+        ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)}</span>` : ''}
+        <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
+      </button>`).join('') || '<div class="empty">No entries.</div>'}
+  `;
+  $('details-body').querySelectorAll('.tx-row').forEach((b) => b.onclick = () => {
+    const e = sorted.find((x) => x.id === b.dataset.txid);
+    closeModal('details-modal');
+    if (e) openEntryModal(e);
+  });
+  $('details-modal').classList.remove('hidden');
+}
+
 // ═══════════════ TRANSACTIONS ═══════════════
 function renderTransactions() {
   const el = $('view-transactions');
@@ -511,7 +705,7 @@ function renderTransactions() {
     const dt = new Date(d + 'T00:00:00');
     const head = dt.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
     const items = groups[d].map((e) => `
-      <button class="tx-row ${e.type}" data-txid="${esc(e.id)}" ${e.virtual ? `data-rec="${esc(e.recurringId)}"` : ''}>
+      <button class="tx-row ${e.type}" data-txid="${esc(e.id)}">
         <span class="tx-dot">${e.type === 'income' ? '↑' : '↓'}</span>
         <span class="tx-main">
           <span class="tx-title">${esc(e.note || e.subcategory || e.category)}</span>
@@ -519,6 +713,7 @@ function renderTransactions() {
         </span>
         ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">⟳ ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
         ${e.source === 'project' ? '<span class="badge">▣ project</span>' : ''}
+        ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)} household</span>` : ''}
         <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('');
     return `<div class="day-group"><div class="day-head">${head}</div>${items}</div>`;
@@ -554,27 +749,35 @@ function renderTransactions() {
   const si = $('f-search');
   si.oninput = (e) => { S.txFilter.search = e.target.value; render(); const el2 = $('f-search'); el2.focus(); el2.setSelectionRange(el2.value.length, el2.value.length); };
   el.querySelectorAll('.tx-row').forEach((b) => b.onclick = () => {
-    if (b.dataset.rec) {
-      const rule = S.recurring.find((r) => r.id === b.dataset.rec);
-      const inst = allEntries().find((e) => e.id === b.dataset.txid);
-      if (rule && inst) openOvrModal(rule, inst.monthKey);
-    } else {
-      const tx = S.transactions.find((t) => t.id === b.dataset.txid);
-      if (!tx) return;
-      if (tx.source === 'project') {
-        const p = S.projects.find((pr) => pr.id === tx.projectId);
-        if (p) openPexpModal(p, tx);
-      } else openTxModal(tx);
-    }
+    const e = allEntries().find((x) => x.id === b.dataset.txid);
+    if (e) openEntryModal(e);
   });
 }
 
 // ═══════════════ RECURRING ═══════════════
+// Whether "Trigger early" makes sense right now: the rule must be active this month,
+// not already adjusted/skipped this month, and its usual day must still be ahead of us.
+function canTriggerEarly(rule) {
+  const now = new Date();
+  if (!ruleActiveIn(rule, now.getFullYear(), now.getMonth())) return false;
+  const nowKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  if (rule.overrides?.[nowKey]) return false;
+  return now.getDate() < rule.day;
+}
+
+async function triggerRecurringEarly(rule) {
+  const now = new Date();
+  const nowKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  await updateDoc(scopedDoc(rule.scope, 'recurring', rule.id),
+    { [`overrides.${nowKey}`]: { amount: rule.amount, day: now.getDate() } });
+  toast(`Triggered early — moved to today (day ${now.getDate()})`);
+}
+
 function renderRecurring() {
   const el = $('view-recurring');
   const now = new Date();
   const nowKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  const rules = [...S.recurring].sort((a, b) => a.name.localeCompare(b.name));
+  const rules = [...S.recurring, ...S.householdRecurring].sort((a, b) => a.name.localeCompare(b.name));
 
   const rows = rules.map((r) => {
     let status = 'active', badge = '<span class="badge">Active</span>';
@@ -582,47 +785,70 @@ function renderRecurring() {
     else if (r.endMonth && r.endMonth < nowKey) { status = 'ended'; badge = '<span class="badge ended">Ended</span>'; }
     const range = `${r.startMonth} → ${r.endMonth || 'ongoing'}`;
     const nOvr = Object.keys(r.overrides || {}).length;
-    return `<button class="tx-row ${r.type}" data-recid="${esc(r.id)}">
+    const early = canTriggerEarly(r);
+    return `<div class="tx-row ${r.type}" data-recid="${esc(r.id)}" data-recscope="${r.scope}" role="button" tabindex="0">
       <span class="tx-dot">⟳</span>
       <span class="tx-main">
         <span class="tx-title">${esc(r.name)}</span>
         <span class="tx-sub">${esc(r.category)}${r.subcategory ? ' · ' + esc(r.subcategory) : ''} · day ${r.day} · ${range}${nOvr ? ` · ${nOvr} adjusted month${nOvr === 1 ? '' : 's'}` : ''}</span>
       </span>
       ${badge}
+      ${r.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(r.addedBy))}">${houseIcon(11)} household</span>` : ''}
+      ${early ? `<button type="button" class="btn btn-sm" data-trigger="${esc(r.id)}" data-trigscope="${r.scope}" title="Move this month's charge to today instead of day ${r.day}">⚡ Trigger early</button>` : ''}
       <span class="tx-amt">${r.type === 'income' ? '+' : '−'}${fmt(r.amount).replace('−', '')}/mo</span>
-    </button>`;
+    </div>`;
   }).join('');
 
   const activeExp = rules.filter((r) => r.type === 'expense' && r.startMonth <= nowKey && (!r.endMonth || r.endMonth >= nowKey));
-  const thisMonthInstances = expandRecurring(now.getFullYear())
-    .filter((e) => e.type === 'expense' && e.monthKey === nowKey);
+  const thisMonthInstances = [
+    ...expandRecurring(now.getFullYear(), S.recurring),
+    ...expandRecurring(now.getFullYear(), S.householdRecurring),
+  ].filter((e) => e.type === 'expense' && e.monthKey === nowKey);
   const monthlyLoad = sum(thisMonthInstances);
 
   el.innerHTML = `
     <h1>Recurring</h1>
     <div class="stat-grid" style="grid-template-columns:1fr 1fr">
       <div class="card stat"><div class="lbl">Active monthly expenses</div><div class="val mono">${fmt(monthlyLoad)}</div><div class="sub">${activeExp.length} rule${activeExp.length === 1 ? '' : 's'} this month</div></div>
-      <div class="card stat"><div class="lbl">How it works</div><div class="sub" style="margin-top:6px">Each rule repeats monthly between its start and end month and appears automatically in Entries and Overview.</div></div>
+      <div class="card stat"><div class="lbl">How it works</div><div class="sub" style="margin-top:6px">Each rule repeats monthly between its start and end month and appears automatically in Entries and Overview.${S.household ? ` ${houseIcon(11)} household rules are shared with everyone in your household.` : ''}</div></div>
     </div>
     <div style="height:14px"></div>
     ${rows || '<div class="empty">No recurring rules yet.<br>Add rent, subscriptions, salary — anything monthly.</div>'}
   `;
-  el.querySelectorAll('.tx-row').forEach((b) => b.onclick = () => {
-    const rule = S.recurring.find((r) => r.id === b.dataset.recid);
-    if (rule) openRecModal(rule);
+  el.querySelectorAll('.tx-row').forEach((row) => {
+    const openRow = () => {
+      const rule = (row.dataset.recscope === 'household' ? S.householdRecurring : S.recurring)
+        .find((r) => r.id === row.dataset.recid);
+      if (rule) openRecModal(rule);
+    };
+    row.addEventListener('click', (ev) => { if (!ev.target.closest('[data-trigger]')) openRow(); });
+    row.addEventListener('keydown', (ev) => {
+      if ((ev.key === 'Enter' || ev.key === ' ') && !ev.target.closest('[data-trigger]')) { ev.preventDefault(); openRow(); }
+    });
   });
+  el.querySelectorAll('[data-trigger]').forEach((b) => b.addEventListener('click', async (ev) => {
+    ev.stopPropagation();
+    const rule = (b.dataset.trigscope === 'household' ? S.householdRecurring : S.recurring)
+      .find((r) => r.id === b.dataset.trigger);
+    if (rule) await triggerRecurringEarly(rule);
+  }));
 }
 
 // ═══════════════ PROJECTS ═══════════════
-function projectExpensesFor(id) {
-  return S.projectExpenses.filter((e) => e.projectId === id);
+function allProjects() { return [...S.projects, ...S.householdProjects]; }
+function findProject(scope, id) {
+  return (scope === 'household' ? S.householdProjects : S.projects).find((p) => p.id === id);
+}
+function projectExpensesFor(project) {
+  const list = project.scope === 'household' ? S.householdProjectExpenses : S.projectExpenses;
+  return list.filter((e) => e.projectId === project.id);
 }
 
 // A checklist item is { id, name, estimate, expenseId }. It's "checked" iff expenseId
 // still resolves to a live expense — so deleting that expense from the Expenses list
 // automatically shows the item as unchecked again, instead of drifting out of sync.
-function clChecked(item) {
-  return !!item.expenseId && S.projectExpenses.some((e) => e.id === item.expenseId);
+function clChecked(project, item) {
+  return !!item.expenseId && projectExpensesFor(project).some((e) => e.id === item.expenseId);
 }
 
 async function toggleChecklistItem(project, itemId, checked) {
@@ -632,7 +858,7 @@ async function toggleChecklistItem(project, itemId, checked) {
   const item = list[idx];
   const next = [...list];
   if (checked) {
-    const ref = await addDoc(userCol('transactions'), {
+    const data = {
       type: 'expense',
       amount: Math.round((Number(item.estimate) || 0) * 100) / 100,
       date: todayStr(),
@@ -641,70 +867,72 @@ async function toggleChecklistItem(project, itemId, checked) {
       note: item.name,
       source: 'project',
       projectId: project.id,
-    });
+    };
+    if (project.scope === 'household') data.addedBy = S.user.uid;
+    const ref = await addDoc(scopedCol(project.scope, 'transactions'), data);
     next[idx] = { ...item, expenseId: ref.id };
   } else {
-    if (item.expenseId) await deleteDoc(userDoc('transactions', item.expenseId)).catch(() => {});
+    if (item.expenseId) await deleteDoc(scopedDoc(project.scope, 'transactions', item.expenseId)).catch(() => {});
     next[idx] = { ...item, expenseId: null };
   }
-  await updateDoc(userDoc('projects', project.id), { checklist: next });
+  await updateDoc(scopedDoc(project.scope, 'projects', project.id), { checklist: next });
 }
 
 async function addChecklistItem(project, name, estimate) {
   const item = { id: genId(), name, estimate: Math.round((Number(estimate) || 0) * 100) / 100, expenseId: null };
-  await updateDoc(userDoc('projects', project.id), { checklist: [...(project.checklist || []), item] });
+  await updateDoc(scopedDoc(project.scope, 'projects', project.id), { checklist: [...(project.checklist || []), item] });
 }
 
 async function deleteChecklistItem(project, itemId) {
   const item = (project.checklist || []).find((i) => i.id === itemId);
   if (!item) return;
-  if (clChecked(item) && !confirm('This also deletes the expense it logged. Continue?')) return;
-  if (item.expenseId) await deleteDoc(userDoc('transactions', item.expenseId)).catch(() => {});
-  await updateDoc(userDoc('projects', project.id),
+  if (clChecked(project, item) && !confirm('This also deletes the expense it logged. Continue?')) return;
+  if (item.expenseId) await deleteDoc(scopedDoc(project.scope, 'transactions', item.expenseId)).catch(() => {});
+  await updateDoc(scopedDoc(project.scope, 'projects', project.id),
     { checklist: (project.checklist || []).filter((i) => i.id !== itemId) });
 }
 
 function renderProjects() {
   const el = $('view-projects');
-  const projects = [...S.projects].sort((a, b) =>
+  const projects = allProjects().sort((a, b) =>
     (a.archived ? 1 : 0) - (b.archived ? 1 : 0) || a.name.localeCompare(b.name));
   const activeCount = projects.filter((p) => !p.archived).length;
-  const totalAll = sum(S.projectExpenses);
+  const totalAll = sum(S.projectExpenses) + sum(S.householdProjectExpenses);
 
   const rows = projects.map((p) => {
-    const exps = projectExpensesFor(p.id).sort((a, b) => b.date.localeCompare(a.date));
+    const exps = projectExpensesFor(p).sort((a, b) => b.date.localeCompare(a.date));
     const spent = sum(exps);
     const pct = p.budget ? Math.min(100, Math.round((spent / p.budget) * 100)) : null;
     const over = p.budget && spent > p.budget;
     const expItems = exps.map((e) => `
-      <button class="tx-row expense" data-pexpid="${esc(e.id)}" data-projid="${esc(p.id)}">
+      <button class="tx-row expense" data-pexpid="${esc(e.id)}" data-projid="${esc(p.id)}" data-projscope="${p.scope}">
         <span class="tx-dot">↓</span>
         <span class="tx-main">
           <span class="tx-title">${esc(e.note || p.name)}</span>
-          <span class="tx-sub">${esc(e.date)}</span>
+          <span class="tx-sub">${esc(e.date)}${p.scope === 'household' ? ` · added by ${esc(memberLabel(e.addedBy))}` : ''}</span>
         </span>
         <span class="tx-amt">−${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('');
 
     const items = p.checklist || [];
     const clIsOpen = items.length > 0 || S.checklistOpen.has(p.id);
-    const doneCount = items.filter(clChecked).length;
+    const doneCount = items.filter((i) => clChecked(p, i)).length;
     const estTotal = items.reduce((a, i) => a + (Number(i.estimate) || 0), 0);
     const addRow = `<div class="settings-row cl-add-row">
       <input type="text" class="cl-name-input" data-projid="${esc(p.id)}" placeholder="Item name" maxlength="60">
       <input type="number" class="cl-est-input" data-projid="${esc(p.id)}" placeholder="Est. €" step="0.01" min="0">
-      <button type="button" class="btn btn-sm" data-addcl="${esc(p.id)}">+ Add item</button>
+      <button type="button" class="btn btn-sm" data-addcl="${esc(p.id)}" data-projscope="${p.scope}">+ Add item</button>
     </div>`;
     const checklistBlock = clIsOpen ? `
       <div class="section-title" style="margin-top:0">Checklist <span class="hint" style="margin:0;text-transform:none;font-weight:400">(optional)</span></div>
       ${items.map((item) => {
-        const checked = clChecked(item);
+        const checked = clChecked(p, item);
         return `<label class="cl-item">
-          <input type="checkbox" data-clid="${esc(item.id)}" data-projid="${esc(p.id)}" ${checked ? 'checked' : ''}>
+          <input type="checkbox" data-clid="${esc(item.id)}" data-projid="${esc(p.id)}" data-projscope="${p.scope}" ${checked ? 'checked' : ''}>
           <span class="cl-name ${checked ? 'done' : ''}">${esc(item.name)}</span>
           <span class="spacer"></span>
           <span class="mono cl-est">${fmt0(item.estimate)}</span>
-          <button type="button" class="icon-btn" data-delcl="${esc(item.id)}" data-projid="${esc(p.id)}" aria-label="Remove ${esc(item.name)}">✕</button>
+          <button type="button" class="icon-btn" data-delcl="${esc(item.id)}" data-projid="${esc(p.id)}" data-projscope="${p.scope}" aria-label="Remove ${esc(item.name)}">✕</button>
         </label>`;
       }).join('') || '<p class="hint" style="margin:0 0 8px">Add planned expenses with an estimate — checking one off logs it as a real expense below.</p>'}
       ${addRow}
@@ -713,7 +941,7 @@ function renderProjects() {
 
     return `<div class="card project-card ${p.archived ? 'archived' : ''}">
       <div class="project-head" data-projtoggle="${esc(p.id)}">
-        <span><b>${esc(p.name)}</b>${p.archived ? ' <span class="badge ended">Done</span>' : ''}</span>
+        <span><b>${esc(p.name)}</b>${p.archived ? ' <span class="badge ended">Done</span>' : ''}${p.scope === 'household' ? ` <span class="badge household">${houseIcon(11)} household</span>` : ''}</span>
         <div class="spacer"></div>
         <span class="mono">${fmt(spent)}${p.budget ? ` / ${fmt0(p.budget)} ${S.settings.currency}` : ''}</span>
       </div>
@@ -724,10 +952,10 @@ function renderProjects() {
         <div class="section-title">Expenses</div>
         ${expItems || '<div class="empty" style="padding:16px">No expenses logged yet.</div>'}
         <div class="modal-actions" style="flex-wrap:wrap">
-          <button type="button" class="btn btn-sm" data-addexp="${esc(p.id)}">+ Add expense</button>
+          <button type="button" class="btn btn-sm" data-addexp="${esc(p.id)}" data-projscope="${p.scope}">+ Add expense</button>
           <div class="spacer"></div>
-          <button type="button" class="btn btn-sm" data-editproj="${esc(p.id)}">Edit</button>
-          <button type="button" class="btn btn-sm" data-archproj="${esc(p.id)}">${p.archived ? 'Reopen' : 'Mark done'}</button>
+          <button type="button" class="btn btn-sm" data-editproj="${esc(p.id)}" data-projscope="${p.scope}">Edit</button>
+          <button type="button" class="btn btn-sm" data-archproj="${esc(p.id)}" data-projscope="${p.scope}">${p.archived ? 'Reopen' : 'Mark done'}</button>
         </div>
       </div>
     </div>`;
@@ -741,7 +969,7 @@ function renderProjects() {
     </div>
     <div class="section-title">Your projects</div>
     <div class="card settings-row" style="margin-bottom:14px">
-      <span class="hint" style="margin:0">Track a one-off big spend — a renovation, a trip, a wedding — broken into individual expenses. They also show up in Overview under “Projects”.</span>
+      <span class="hint" style="margin:0">Track a one-off big spend — a renovation, a trip, a wedding — broken into individual expenses. They also show up in Overview under “Projects”.${S.household ? ` ${houseIcon(11)} household projects are visible and editable by anyone in your household.` : ''}</span>
       <div class="spacer"></div>
       <button type="button" class="btn btn-primary btn-sm" id="new-project">+ New project</button>
     </div>
@@ -756,22 +984,23 @@ function renderProjects() {
   });
   el.querySelectorAll('[data-addexp]').forEach((b) => b.onclick = (ev) => {
     ev.stopPropagation();
-    const p = S.projects.find((pr) => pr.id === b.dataset.addexp);
+    const p = findProject(b.dataset.projscope, b.dataset.addexp);
     if (p) openPexpModal(p);
   });
   el.querySelectorAll('[data-editproj]').forEach((b) => b.onclick = (ev) => {
     ev.stopPropagation();
-    const p = S.projects.find((pr) => pr.id === b.dataset.editproj);
+    const p = findProject(b.dataset.projscope, b.dataset.editproj);
     if (p) openProjectModal(p);
   });
   el.querySelectorAll('[data-archproj]').forEach((b) => b.onclick = async (ev) => {
     ev.stopPropagation();
-    const p = S.projects.find((pr) => pr.id === b.dataset.archproj);
-    if (p) await updateDoc(userDoc('projects', p.id), { archived: !p.archived });
+    const p = findProject(b.dataset.projscope, b.dataset.archproj);
+    if (p) await updateDoc(scopedDoc(p.scope, 'projects', p.id), { archived: !p.archived });
   });
   el.querySelectorAll('[data-pexpid]').forEach((b) => b.onclick = () => {
-    const p = S.projects.find((pr) => pr.id === b.dataset.projid);
-    const e = S.projectExpenses.find((x) => x.id === b.dataset.pexpid);
+    const p = findProject(b.dataset.projscope, b.dataset.projid);
+    const e = (p?.scope === 'household' ? S.householdProjectExpenses : S.projectExpenses)
+      .find((x) => x.id === b.dataset.pexpid);
     if (p && e) openPexpModal(p, e);
   });
   el.querySelectorAll('[data-startcl]').forEach((b) => b.onclick = (ev) => {
@@ -780,17 +1009,17 @@ function renderProjects() {
     render();
   });
   el.querySelectorAll('[data-clid]').forEach((cb) => cb.onchange = async () => {
-    const p = S.projects.find((pr) => pr.id === cb.dataset.projid);
+    const p = findProject(cb.dataset.projscope, cb.dataset.projid);
     if (p) await toggleChecklistItem(p, cb.dataset.clid, cb.checked);
   });
   el.querySelectorAll('[data-delcl]').forEach((b) => b.onclick = async (ev) => {
     ev.stopPropagation();
-    const p = S.projects.find((pr) => pr.id === b.dataset.projid);
+    const p = findProject(b.dataset.projscope, b.dataset.projid);
     if (p) await deleteChecklistItem(p, b.dataset.delcl);
   });
   el.querySelectorAll('[data-addcl]').forEach((b) => b.onclick = async (ev) => {
     ev.stopPropagation();
-    const p = S.projects.find((pr) => pr.id === b.dataset.addcl);
+    const p = findProject(b.dataset.projscope, b.dataset.addcl);
     if (!p) return;
     const nameInput = el.querySelector(`.cl-name-input[data-projid="${p.id}"]`);
     const estInput = el.querySelector(`.cl-est-input[data-projid="${p.id}"]`);
@@ -799,6 +1028,107 @@ function renderProjects() {
     await addChecklistItem(p, name, estInput.value);
   });
 }
+
+// ═══════════════ LENDING ═══════════════
+// Personal-only reminders for money lent to or borrowed from someone — deliberately
+// kept separate from the transactions ledger so IOUs don't skew income/expense totals.
+function renderLending() {
+  const el = $('view-lending');
+  const today = todayStr();
+  const loans = [...S.loans].sort((a, b) => {
+    if (a.settled !== b.settled) return a.settled ? 1 : -1;
+    return (a.dueDate || a.date).localeCompare(b.dueDate || b.date);
+  });
+  const owedToYou = S.loans.filter((l) => l.direction === 'lent' && !l.settled).reduce((a, l) => a + Number(l.amount), 0);
+  const youOwe = S.loans.filter((l) => l.direction === 'borrowed' && !l.settled).reduce((a, l) => a + Number(l.amount), 0);
+
+  const rows = loans.map((l) => {
+    const overdue = !l.settled && l.dueDate && l.dueDate < today;
+    return `<button class="tx-row ${l.direction === 'lent' ? 'income' : 'expense'} ${l.settled ? 'settled' : ''}" data-loanid="${esc(l.id)}">
+      <span class="tx-dot">${l.direction === 'lent' ? '↑' : '↓'}</span>
+      <span class="tx-main">
+        <span class="tx-title">${esc(l.person)}</span>
+        <span class="tx-sub">${l.direction === 'lent' ? 'They owe you' : 'You owe them'} · ${esc(l.date)}${l.dueDate ? ` · due ${esc(l.dueDate)}` : ''}${l.note ? ' · ' + esc(l.note) : ''}</span>
+      </span>
+      ${l.settled ? '<span class="badge ended">Settled</span>' : overdue ? '<span class="badge overdue">Overdue</span>' : ''}
+      <span class="tx-amt">${fmt(l.amount)}</span>
+    </button>`;
+  }).join('');
+
+  el.innerHTML = `
+    <h1>Lending</h1>
+    <p class="hint" style="margin:-8px 0 20px">A reminder list for money lent or borrowed between you and someone else — kept separate from your regular income/expenses so it doesn't skew your totals.</p>
+    <div class="stat-grid" style="grid-template-columns:1fr 1fr">
+      <div class="card stat"><div class="lbl">Owed to you</div><div class="val mono pos">${fmt(owedToYou)}</div></div>
+      <div class="card stat"><div class="lbl">You owe</div><div class="val mono neg">${fmt(youOwe)}</div></div>
+    </div>
+    <div style="height:14px"></div>
+    ${rows || '<div class="empty">No loans tracked yet. Tap + to log money lent or borrowed.</div>'}
+  `;
+  el.querySelectorAll('.tx-row').forEach((b) => b.onclick = () => {
+    const l = S.loans.find((x) => x.id === b.dataset.loanid);
+    if (l) openLoanModal(l);
+  });
+}
+
+let loanDir = 'lent';
+
+function openLoanModal(loan = null) {
+  S.editingLoan = loan;
+  loanDir = loan?.direction || 'lent';
+  $('loan-modal-title').textContent = loan ? 'Edit loan' : 'New loan';
+  $('loan-delete').classList.toggle('hidden', !loan);
+  $('loan-settle').classList.toggle('hidden', !loan);
+  $('loan-settle').textContent = loan?.settled ? 'Reopen' : 'Mark settled';
+  $('loan-person').value = loan?.person || '';
+  $('loan-amount').value = loan?.amount ?? '';
+  $('loan-date').value = loan?.date || todayStr();
+  $('loan-due').value = loan?.dueDate || '';
+  $('loan-note').value = loan?.note || '';
+  document.querySelectorAll('[data-loandir]').forEach((b) => b.classList.toggle('active', b.dataset.loandir === loanDir));
+  $('loan-modal').classList.remove('hidden');
+  setTimeout(() => $('loan-person').focus(), 50);
+}
+
+document.querySelectorAll('[data-loandir]').forEach((b) => b.addEventListener('click', () => {
+  loanDir = b.dataset.loandir;
+  document.querySelectorAll('[data-loandir]').forEach((x) => x.classList.toggle('active', x === b));
+}));
+
+$('loan-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const data = {
+    direction: loanDir,
+    person: $('loan-person').value.trim(),
+    amount: Math.round(Number($('loan-amount').value) * 100) / 100,
+    date: $('loan-date').value,
+    dueDate: $('loan-due').value || null,
+    note: $('loan-note').value.trim(),
+  };
+  if (!data.person || !data.amount || !data.date) return;
+  const editing = S.editingLoan;
+  try {
+    if (editing) { data.settled = !!editing.settled; await updateDoc(userDoc('loans', editing.id), data); }
+    else await addDoc(userCol('loans'), { ...data, settled: false });
+    closeModal('loan-modal');
+    toast(editing ? 'Loan updated' : 'Loan added');
+  } catch { toast('Could not save — check your connection'); }
+});
+
+$('loan-settle').addEventListener('click', async () => {
+  if (!S.editingLoan) return;
+  await updateDoc(userDoc('loans', S.editingLoan.id), { settled: !S.editingLoan.settled });
+  closeModal('loan-modal');
+  toast(S.editingLoan.settled ? 'Reopened' : 'Marked settled');
+});
+
+$('loan-delete').addEventListener('click', async () => {
+  if (!S.editingLoan) return;
+  if (!confirm(`Delete this loan record with ${S.editingLoan.person}?`)) return;
+  await deleteDoc(userDoc('loans', S.editingLoan.id));
+  closeModal('loan-modal');
+  toast('Loan deleted');
+});
 
 // ═══════════════ INVESTMENTS ═══════════════
 function renderInvestments() {
@@ -847,6 +1177,137 @@ function renderInvestments() {
       toast('Saved');
     };
   });
+}
+
+// ═══════════════ HOUSEHOLD ═══════════════
+function renderHousehold() {
+  const el = $('view-household');
+
+  if (!S.household) {
+    el.innerHTML = `
+      <h1>Household</h1>
+      <p class="hint" style="margin:-8px 0 20px">Share one pool of transactions, recurring rules, and projects with someone else — your partner, a roommate, whoever. Shared data is combined right alongside your personal entries in Overview, but stays separate from anything you mark Personal.</p>
+      <div class="card" style="margin-bottom:14px">
+        <div class="section-title" style="margin-top:0">Create a household</div>
+        <p class="hint" style="margin-bottom:10px">You'll get a join code to send to whoever you want to share with — no email lookup needed.</p>
+        <button class="btn btn-primary btn-sm" id="hh-create">Create household</button>
+      </div>
+      <div class="card">
+        <div class="section-title" style="margin-top:0">Join a household</div>
+        <p class="hint" style="margin-bottom:10px">Paste the code someone shared with you.</p>
+        <button class="btn btn-sm" id="hh-join">Join with a code…</button>
+      </div>
+    `;
+    $('hh-create').onclick = createHousehold;
+    $('hh-join').onclick = () => {
+      const code = prompt('Paste the household join code:');
+      if (code) joinHousehold(code);
+    };
+    return;
+  }
+
+  const h = S.household;
+  const isOwner = h.ownerUid === S.user.uid;
+  const memberRows = (h.members || []).map((uid) => `
+    <div class="settings-row">
+      <span>${esc(h.memberNames?.[uid] || uid)}${uid === S.user.uid ? ' <span class="hint" style="margin:0">(you)</span>' : ''}</span>
+      <div class="spacer"></div>
+      ${uid === h.ownerUid ? '<span class="badge">Owner</span>' : ''}
+    </div>`).join('');
+
+  el.innerHTML = `
+    <h1>Household</h1>
+    <div class="card" style="margin-bottom:14px">
+      <div class="section-title" style="margin-top:0">${esc(h.name)}</div>
+      ${memberRows}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <div class="section-title" style="margin-top:0">Invite someone</div>
+      <p class="hint" style="margin-bottom:10px">Send them this code any way you like (text, chat, in person). They sign in on their own account, then paste it into Join household.</p>
+      <div class="settings-row">
+        <code class="join-code">${esc(h.id)}</code>
+        <button class="btn btn-sm" id="hh-copy">Copy</button>
+      </div>
+    </div>
+    <div class="section-title">Danger zone</div>
+    <div class="card settings-row">
+      <span class="hint" style="margin:0;flex:1">${isOwner ? 'As the owner, deleting removes all shared transactions, recurring rules, and projects for every member.' : 'Your personal data stays untouched; shared entries just disappear from your view.'}</span>
+      <button class="btn btn-sm btn-danger" id="hh-leave">Leave household</button>
+      ${isOwner ? '<button class="btn btn-sm btn-danger" id="hh-delete">Delete household</button>' : ''}
+    </div>
+  `;
+  $('hh-copy').onclick = async () => {
+    try { await navigator.clipboard.writeText(h.id); toast('Code copied'); }
+    catch { toast(`Code: ${h.id}`); }
+  };
+  $('hh-leave').onclick = leaveHousehold;
+  const del = $('hh-delete'); if (del) del.onclick = deleteHousehold;
+}
+
+async function createHousehold() {
+  if (S.household) { toast('Leave your current household first'); return; }
+  const name = prompt('Name your household (e.g. "The Smiths"):', 'Our household');
+  if (!name?.trim()) return;
+  try {
+    await addDoc(collection(db, 'households'), {
+      name: name.trim(),
+      ownerUid: S.user.uid,
+      members: [S.user.uid],
+      memberNames: { [S.user.uid]: S.user.email },
+      createdAt: todayStr(),
+    });
+    toast('Household created');
+  } catch (ex) { console.error(ex); toast('Could not create household'); }
+}
+
+async function joinHousehold(code) {
+  if (S.household) { toast('Leave your current household first'); return; }
+  const id = code.trim();
+  if (!id) return;
+  try {
+    const ref = doc(db, 'households', id);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) { toast('No household found with that code'); return; }
+    const data = snap.data();
+    if ((data.members || []).includes(S.user.uid)) { toast('You are already in this household'); return; }
+    await updateDoc(ref, {
+      members: arrayUnion(S.user.uid),
+      [`memberNames.${S.user.uid}`]: S.user.email,
+    });
+    toast(`Joined “${data.name}”`);
+  } catch (ex) { console.error(ex); toast('Could not join — check the code and try again'); }
+}
+
+async function leaveHousehold() {
+  if (!S.household) return;
+  if (!confirm(`Leave “${S.household.name}”? You'll keep your personal data; shared entries disappear from your view.`)) return;
+  const ref = doc(db, 'households', S.household.id);
+  try {
+    await updateDoc(ref, {
+      members: arrayRemove(S.user.uid),
+      [`memberNames.${S.user.uid}`]: deleteField(),
+    });
+    toast('Left household');
+  } catch (ex) { console.error(ex); toast('Could not leave — try again'); }
+}
+
+async function deleteHousehold() {
+  if (!S.household || S.household.ownerUid !== S.user.uid) return;
+  const h = S.household;
+  if (!confirm(`Delete “${h.name}”? This permanently removes all shared transactions, recurring rules, and projects for every member. This cannot be undone.`)) return;
+  try {
+    for (const name of ['transactions', 'recurring', 'projects']) {
+      const snap = await getDocs(householdCol(name));
+      const docsArr = snap.docs;
+      for (let i = 0; i < docsArr.length; i += 400) {
+        const b = writeBatch(db);
+        docsArr.slice(i, i + 400).forEach((d) => b.delete(d.ref));
+        await b.commit();
+      }
+    }
+    await deleteDoc(doc(db, 'households', h.id));
+    toast('Household deleted');
+  } catch (ex) { console.error(ex); toast('Could not delete — try again'); }
 }
 
 // ═══════════════ SETTINGS ═══════════════
@@ -983,10 +1444,11 @@ function renderSettings() {
 }
 
 function exportCSV() {
-  const rows = [['Date', 'Type', 'Category', 'Subcategory', 'Note', 'Amount', 'Recurring']];
+  const rows = [['Date', 'Type', 'Category', 'Subcategory', 'Note', 'Amount', 'Recurring', 'Scope']];
   const entries = allEntries().sort((a, b) => a.date.localeCompare(b.date));
   for (const e of entries) {
-    rows.push([e.date, e.type, e.category, e.subcategory || '', e.note || '', Number(e.amount).toFixed(2), e.virtual ? 'yes' : 'no']);
+    rows.push([e.date, e.type, e.category, e.subcategory || '', e.note || '', Number(e.amount).toFixed(2),
+      e.virtual ? 'yes' : 'no', e.scope === 'household' ? 'Household' : 'Personal']);
   }
   const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
   const a = document.createElement('a');
@@ -1131,7 +1593,8 @@ async function importExcel(file) {
   const parts = [`${counts.expense} expense + ${counts.income} income entries for ${y} (dated the 15th of each month)`];
   if (startBal != null) parts.push(`starting balance ${startBal}`);
   if (invMonths) parts.push('the Investment tracker');
-  const warn = S.recurring.length ? '\n\nHeads-up: months already covered by your recurring rules would be counted twice.' : '';
+  const warn = (S.recurring.length + S.householdRecurring.length)
+    ? '\n\nHeads-up: months already covered by your recurring rules would be counted twice.' : '';
   if (!confirm(`Import ${parts.join(', ')}?\n\nRe-importing the same workbook updates entries instead of duplicating them.${warn}`)) return;
 
   await commitBatch(writes);
@@ -1345,9 +1808,38 @@ function fillCategorySelects(prefix, type, cat, sub) {
   catSel.onchange = fillSubs;
 }
 
+let txScope = 'personal';
+
+// Shows/hides a modal's Personal/Household toggle: hidden (with a read-only hint
+// instead) when editing an existing item, since scope can't change after creation;
+// shown only for brand-new items, and only if the user is actually in a household.
+function setupScopeUI(prefix, existing, defaultScope) {
+  const row = $(`${prefix}-scope-row`);
+  const hint = $(`${prefix}-scope-hint`);
+  if (existing) {
+    row.classList.add('hidden');
+    if (existing.scope === 'household') {
+      hint.innerHTML = `${houseIcon(11)} Shared with your household — added by ${esc(memberLabel(existing.addedBy))}.`;
+      hint.classList.remove('hidden');
+    } else {
+      hint.classList.add('hidden');
+    }
+    return existing.scope || 'personal';
+  }
+  hint.classList.add('hidden');
+  if (S.household) {
+    row.classList.remove('hidden');
+    row.querySelectorAll('.seg-btn').forEach((b) => b.classList.toggle('active', b.dataset[`${prefix}scope`] === 'personal'));
+  } else {
+    row.classList.add('hidden');
+  }
+  return defaultScope;
+}
+
 function openTxModal(tx = null) {
   S.editingTx = tx;
   txType = tx?.type || 'expense';
+  txScope = setupScopeUI('tx', tx, 'personal');
   $('tx-modal-title').textContent = tx ? 'Edit entry' : 'Add entry';
   $('tx-delete').classList.toggle('hidden', !tx);
   $('tx-amount').value = tx?.amount ?? '';
@@ -1366,8 +1858,15 @@ document.querySelectorAll('[data-txtype]').forEach((b) => b.addEventListener('cl
   fillCategorySelects('tx', txType);
 }));
 
+document.querySelectorAll('[data-txscope]').forEach((b) => b.addEventListener('click', () => {
+  txScope = b.dataset.txscope;
+  document.querySelectorAll('[data-txscope]').forEach((x) => x.classList.toggle('active', x === b));
+}));
+
 $('tx-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  const wasEditing = !!S.editingTx;
+  const scope = wasEditing ? S.editingTx.scope : txScope;
   const data = {
     type: txType,
     amount: Math.round(Number($('tx-amount').value) * 100) / 100,
@@ -1377,10 +1876,10 @@ $('tx-form').addEventListener('submit', async (e) => {
     note: $('tx-note').value.trim(),
   };
   if (!data.amount || !data.date) return;
-  const wasEditing = !!S.editingTx;
+  if (!wasEditing && scope === 'household') data.addedBy = S.user.uid;
   try {
-    if (wasEditing) await updateDoc(userDoc('transactions', S.editingTx.id), data);
-    else await addDoc(userCol('transactions'), data);
+    if (wasEditing) await updateDoc(scopedDoc(scope, 'transactions', S.editingTx.id), data);
+    else await addDoc(scopedCol(scope, 'transactions'), data);
     closeModal('tx-modal');
     if (Number(data.date.slice(0, 4)) !== S.year) toast(`Saved to ${data.date.slice(0, 4)} — switch year to see it`);
     else toast(wasEditing ? 'Entry updated' : 'Entry added');
@@ -1390,17 +1889,19 @@ $('tx-form').addEventListener('submit', async (e) => {
 $('tx-delete').addEventListener('click', async () => {
   if (!S.editingTx) return;
   if (!confirm('Delete this entry?')) return;
-  await deleteDoc(userDoc('transactions', S.editingTx.id));
+  await deleteDoc(scopedDoc(S.editingTx.scope, 'transactions', S.editingTx.id));
   closeModal('tx-modal');
   toast('Entry deleted');
 });
 
 // ═══════════════ RECURRING MODAL ═══════════════
 let recType = 'expense';
+let recScope = 'personal';
 
 function openRecModal(rule = null) {
   S.editingRec = rule;
   recType = rule?.type || 'expense';
+  recScope = setupScopeUI('rec', rule, 'personal');
   $('rec-modal-title').textContent = rule ? 'Edit recurring' : 'Add recurring';
   $('rec-delete').classList.toggle('hidden', !rule);
   $('rec-name').value = rule?.name || '';
@@ -1429,8 +1930,8 @@ function renderRecOverrides(rule) {
       <button type="button" class="icon-btn" data-clearovr="${k}" aria-label="Remove adjustment for ${k}">✕</button>
     </div>`).join('');
   box.querySelectorAll('[data-clearovr]').forEach((b) => b.onclick = async () => {
-    await updateDoc(userDoc('recurring', rule.id), { [`overrides.${b.dataset.clearovr}`]: deleteField() });
-    const fresh = S.recurring.find((r) => r.id === rule.id);
+    await updateDoc(scopedDoc(rule.scope, 'recurring', rule.id), { [`overrides.${b.dataset.clearovr}`]: deleteField() });
+    const fresh = (rule.scope === 'household' ? S.householdRecurring : S.recurring).find((r) => r.id === rule.id);
     renderRecOverrides({ ...rule, overrides: Object.fromEntries(Object.entries(ovr).filter(([kk]) => kk !== b.dataset.clearovr)) });
     if (fresh) S.editingRec = fresh;
     toast('Adjustment removed');
@@ -1443,11 +1944,18 @@ document.querySelectorAll('[data-rectype]').forEach((b) => b.addEventListener('c
   fillCategorySelects('rec', recType);
 }));
 
+document.querySelectorAll('[data-recscope]').forEach((b) => b.addEventListener('click', () => {
+  recScope = b.dataset.recscope;
+  document.querySelectorAll('[data-recscope]').forEach((x) => x.classList.toggle('active', x === b));
+}));
+
 $('rec-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const start = $('rec-start').value;
   const end = $('rec-end').value || null;
   if (end && end < start) { toast('End month must be after start month'); return; }
+  const wasEditing = !!S.editingRec;
+  const scope = wasEditing ? S.editingRec.scope : recScope;
   const data = {
     type: recType,
     name: $('rec-name').value.trim(),
@@ -1459,10 +1967,10 @@ $('rec-form').addEventListener('submit', async (e) => {
     endMonth: end,
   };
   if (!data.name || !data.amount) return;
-  const wasEditing = !!S.editingRec;
+  if (!wasEditing && scope === 'household') data.addedBy = S.user.uid;
   try {
-    if (wasEditing) await updateDoc(userDoc('recurring', S.editingRec.id), data);
-    else await addDoc(userCol('recurring'), data);
+    if (wasEditing) await updateDoc(scopedDoc(scope, 'recurring', S.editingRec.id), data);
+    else await addDoc(scopedCol(scope, 'recurring'), data);
     closeModal('rec-modal');
     toast(wasEditing ? 'Recurring updated' : 'Recurring added');
   } catch { toast('Could not save — check your connection'); }
@@ -1471,14 +1979,17 @@ $('rec-form').addEventListener('submit', async (e) => {
 $('rec-delete').addEventListener('click', async () => {
   if (!S.editingRec) return;
   if (!confirm(`Delete “${S.editingRec.name}”? All its monthly entries disappear from every month.`)) return;
-  await deleteDoc(userDoc('recurring', S.editingRec.id));
+  await deleteDoc(scopedDoc(S.editingRec.scope, 'recurring', S.editingRec.id));
   closeModal('rec-modal');
   toast('Recurring deleted');
 });
 
 // ═══════════════ PROJECT MODAL ═══════════════
+let projectScope = 'personal';
+
 function openProjectModal(project = null) {
   S.editingProject = project;
+  projectScope = setupScopeUI('project', project, 'personal');
   $('project-modal-title').textContent = project ? 'Edit project' : 'New project';
   $('project-delete').classList.toggle('hidden', !project);
   $('project-name').value = project?.name || '';
@@ -1487,6 +1998,13 @@ function openProjectModal(project = null) {
   $('project-modal').classList.remove('hidden');
   setTimeout(() => $('project-name').focus(), 50);
 }
+
+document.querySelectorAll('[data-projscope]').forEach((b) => {
+  if (b.closest('#project-scope-row')) b.addEventListener('click', () => {
+    projectScope = b.dataset.projscope;
+    document.querySelectorAll('#project-scope-row [data-projscope]').forEach((x) => x.classList.toggle('active', x === b));
+  });
+});
 
 $('project-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1498,20 +2016,22 @@ $('project-form').addEventListener('submit', async (e) => {
     note: $('project-note').value.trim(),
   };
   const editing = S.editingProject;
+  const scope = editing ? editing.scope : projectScope;
   try {
     if (editing) {
       data.archived = !!editing.archived;
-      await updateDoc(userDoc('projects', editing.id), data);
+      await updateDoc(scopedDoc(scope, 'projects', editing.id), data);
       if (editing.name !== name) {
-        const linked = projectExpensesFor(editing.id);
+        const linked = projectExpensesFor(editing);
         for (let i = 0; i < linked.length; i += 400) {
           const b = writeBatch(db);
-          linked.slice(i, i + 400).forEach((e2) => b.update(userDoc('transactions', e2.id), { subcategory: name }));
+          linked.slice(i, i + 400).forEach((e2) => b.update(scopedDoc(scope, 'transactions', e2.id), { subcategory: name }));
           await b.commit();
         }
       }
     } else {
-      await addDoc(userCol('projects'), { ...data, archived: false });
+      if (scope === 'household') data.addedBy = S.user.uid;
+      await addDoc(scopedCol(scope, 'projects'), { ...data, archived: false, checklist: [] });
     }
     closeModal('project-modal');
     toast(editing ? 'Project updated' : 'Project created');
@@ -1520,14 +2040,15 @@ $('project-form').addEventListener('submit', async (e) => {
 
 $('project-delete').addEventListener('click', async () => {
   if (!S.editingProject) return;
-  const linked = projectExpensesFor(S.editingProject.id);
-  if (!confirm(`Delete “${S.editingProject.name}” and its ${linked.length} expense${linked.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+  const project = S.editingProject;
+  const linked = projectExpensesFor(project);
+  if (!confirm(`Delete “${project.name}” and its ${linked.length} expense${linked.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
   for (let i = 0; i < linked.length; i += 400) {
     const b = writeBatch(db);
-    linked.slice(i, i + 400).forEach((e2) => b.delete(userDoc('transactions', e2.id)));
+    linked.slice(i, i + 400).forEach((e2) => b.delete(scopedDoc(project.scope, 'transactions', e2.id)));
     await b.commit();
   }
-  await deleteDoc(userDoc('projects', S.editingProject.id));
+  await deleteDoc(scopedDoc(project.scope, 'projects', project.id));
   closeModal('project-modal');
   toast('Project deleted');
 });
@@ -1558,19 +2079,20 @@ $('pexp-form').addEventListener('submit', async (e) => {
     projectId: project.id,
   };
   if (!data.amount || !data.date) return;
+  if (!expense && project.scope === 'household') data.addedBy = S.user.uid;
   try {
-    if (expense) await updateDoc(userDoc('transactions', expense.id), data);
-    else await addDoc(userCol('transactions'), data);
+    if (expense) await updateDoc(scopedDoc(project.scope, 'transactions', expense.id), data);
+    else await addDoc(scopedCol(project.scope, 'transactions'), data);
     closeModal('pexp-modal');
     toast(expense ? 'Expense updated' : 'Expense added');
   } catch { toast('Could not save — check your connection'); }
 });
 
 $('pexp-delete').addEventListener('click', async () => {
-  const { expense } = S.editingPexp || {};
+  const { project, expense } = S.editingPexp || {};
   if (!expense) return;
   if (!confirm('Delete this expense?')) return;
-  await deleteDoc(userDoc('transactions', expense.id));
+  await deleteDoc(scopedDoc(project.scope, 'transactions', expense.id));
   closeModal('pexp-modal');
   toast('Expense deleted');
 });
@@ -1595,7 +2117,7 @@ function openOvrModal(rule, monthKey) {
 
 async function saveOverride(patch) {
   const { rule, monthKey } = ovrCtx;
-  await updateDoc(userDoc('recurring', rule.id),
+  await updateDoc(scopedDoc(rule.scope, 'recurring', rule.id),
     patch === null
       ? { [`overrides.${monthKey}`]: deleteField() }
       : { [`overrides.${monthKey}`]: patch });
@@ -1621,18 +2143,19 @@ $('ovr-reset').addEventListener('click', async () => {
 $('ovr-edit-rule').addEventListener('click', () => {
   const rule = ovrCtx.rule;
   closeModal('ovr-modal');
-  openRecModal(S.recurring.find((r) => r.id === rule.id) || rule);
+  const list = rule.scope === 'household' ? S.householdRecurring : S.recurring;
+  openRecModal(list.find((r) => r.id === rule.id) || rule);
 });
 
 // ─── Modal plumbing ──────────────────────────────────────────
 function closeModal(id) {
   $(id).classList.add('hidden');
-  S.editingTx = null; S.editingRec = null; S.editingProject = null; S.editingPexp = null;
+  S.editingTx = null; S.editingRec = null; S.editingProject = null; S.editingPexp = null; S.editingLoan = null;
 }
 document.querySelectorAll('[data-close]').forEach((b) =>
   b.addEventListener('click', () => closeModal(b.dataset.close)));
 document.querySelectorAll('.modal-backdrop').forEach((bd) =>
   bd.addEventListener('click', (e) => { if (e.target === bd) closeModal(bd.id); }));
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') ['tx-modal', 'rec-modal', 'ovr-modal', 'rev-modal', 'project-modal', 'pexp-modal'].forEach(closeModal);
+  if (e.key === 'Escape') ['tx-modal', 'rec-modal', 'ovr-modal', 'rev-modal', 'project-modal', 'pexp-modal', 'details-modal', 'loan-modal'].forEach(closeModal);
 });

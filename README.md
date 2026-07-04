@@ -17,6 +17,16 @@ A personal finance web app built to replace the `Finance_2026` Excel workbook. H
 - **Revolut statement import (CSV)** — export a statement from the Revolut app, review every transaction in-app (with auto-guessed Slovenian merchant categories: Mercator/Špar → groceries, Petrol → Bencin, Wolt → dostava, …), adjust categories, import. Your category picks are remembered per merchant. Duplicate-proof.
 - **Live Revolut sync (optional)** — connect your Revolut account through GoCardless Bank Account Data (the free EU open-banking API) and pull transactions with one tap. Requires the Cloud Functions setup below.
 - **Projects** — track a one-off big spend (a renovation, a trip, a wedding) as its own project with an optional budget, broken into individual expenses. Each project shows total spent vs. budget; its expenses also roll up into Overview's "Expenses by category" under a Projects row, broken out per project. Each project can optionally carry a planning checklist (item + estimated cost); checking an item off logs it as a real expense for that amount, and unchecking removes it again.
+- **Household (shared with another person)** — the Household tab lets you create a shared pool of data and invite one other person (or more) into it with a join code — no email lookup needed, so no extra backend required. When you're in a household:
+  - Adding a transaction, recurring rule, or project shows a **Personal / Household** choice. Personal stays private to you; Household is visible and editable by every member.
+  - Household data is **combined with your personal data** everywhere it matters — Overview totals, the category breakdown, the spending chart, Entries, Recurring, and CSV export all merge both pools (household-sourced rows carry a ⌂ badge and show who added them).
+  - Projects can be shared the same way: a household project's expenses can be added and edited by anyone in the household, and still roll up into everyone's Overview.
+  - Investments and Excel/Revolut imports stay personal-only (not shared) to keep those simple.
+  - Leaving a household only removes shared entries from your view; your personal data is untouched. The household's owner can delete it outright, which removes the shared data for everyone.
+  - Household projects get their own grid on Overview ("⌂ Household projects"), separate from your personal "Expenses by category" table, so the two don't blend together.
+- **Drill-down details** — tap any amount in Overview's Monthly summary or Expenses by category tables to see exactly which transactions make it up. Tapping one of those opens it for editing.
+- **Trigger recurring entries early** — if today is before a rule's usual day this month, its Recurring row shows a "⚡ Trigger early" button: it moves just this month's charge to today (handy for "the rent actually went out early this time"). Next month it's back to the normal day automatically — this is a one-off adjustment, not a change to the rule itself.
+- **Lending reminders** — a separate Lending tab tracks money lent to or borrowed from someone (person, amount, optional due date), with overdue flags and a settled/unsettled toggle. Kept out of the main ledger entirely so IOUs don't affect your income/expense totals. Personal only (not shared with a household).
 - Transaction-level tracking with search and month/type filters
 - Income vs expenses bar chart and category donut chart
 - Year-strip: a 12-month mini chart of net savings at the top of Overview
@@ -56,7 +66,7 @@ firebase deploy --only hosting,firestore
 Your app is live at `https://<project-id>.web.app`. (The plain `firebase deploy` also tries to deploy the optional bank-sync functions — skip that until you've done the section below, or leave it out forever; everything else works without it.)
 
 ### 5. First run
-There's no self-service sign-up screen (by design — this is a single-user book, not a public app). Create your account once in the console: **Build → Authentication → Users → Add user**, enter your email + a password. Then open the URL and sign in with those credentials:
+There's no self-service sign-up screen (by design — this is a single-user book, not a public app). Create your account once in the console: **Build → Authentication → Users → Add user**, enter your email + a password. Then open the URL and sign in with those credentials. If you want to share a Household with someone else, create an account for them the same way — then either of you can generate a join code from the Household tab.
 1. Settings → set your **starting balance** — or skip this and just import the Excel, which sets it for you.
 2. Settings → Import → **Choose .xlsx** and pick `Finance_2026_David.xlsx`.
 3. Recurring → add your fixed monthly items (rent, subscriptions, salary as recurring *income*).
@@ -98,9 +108,16 @@ users/{uid}/
   projects/{id}       { name, budget: number | null, note, archived,
                         checklist?: [{ id, name, estimate, expenseId }] }  // optional; checked = expenseId set
   investments/{year}  { months: { "1": {start, invested, pl}, ... } }
+  loans/{id}          { direction: "lent" | "borrowed", person, amount, date, dueDate: string | null, note, settled }
   meta/settings       { startingBalance, currency, categories, merchantMap }
   meta/bank           { requisitionId, institutionName, lastSync }   // only with live sync
+
+households/{id}       { name, ownerUid, members: [uid, ...], memberNames: {uid: email} }
+  transactions/{id}   { …same shape as above, plus addedBy: uid }
+  recurring/{id}      { …same shape as above, plus addedBy: uid }
+  projects/{id}       { …same shape as above, plus addedBy: uid }
 ```
+The household document's id doubles as its join code — creating one generates a random Firestore id, which you share with whoever you're inviting. Anyone signed in can look up a household by that exact id (needed to join), but only members can list a household in a query or read/write its transactions, recurring rules, or projects (see `firestore.rules`).
 Recurring rules are expanded virtually at display time (one entry per month between start and end, inclusive, with per-month overrides applied), so editing a rule instantly updates every month and nothing is duplicated in the database. Imported entries use deterministic ids (`xl-…` for Excel, `rev-…` for Revolut), which is what makes re-imports and re-syncs duplicate-proof.
 
 ## Notes & limits
