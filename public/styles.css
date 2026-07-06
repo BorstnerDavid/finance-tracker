@@ -339,7 +339,17 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 14px; }
 .tx-sub { font-size: 12px; color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tx-amt { font-family: var(--font-mono); font-weight: 600; white-space: nowrap; }
 .tx-row.income .tx-amt { color: var(--amber); }
+
+/* Recurring row: title/amount on one line, status/household/trigger-early badges on
+   their own wrapping line below — keeps a single row from getting overcrowded on phones. */
+.rec-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.rec-line1 { display: flex; align-items: center; gap: 10px; }
+.rec-line1 .tx-main { flex: 1; min-width: 0; }
+.rec-line2 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
@@ -352,11 +362,11 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: 14px; }
 }
 .badge.ended { background: var(--rule); color: var(--ink-soft); }
 .badge.upcoming { background: var(--amber-soft); color: var(--amber); }
-.badge.household { background: var(--brick-soft); color: var(--brick); display: inline-flex; align-items: center; gap: 3px; }
+.badge.household { background: var(--brick-soft); color: var(--brick); }
 .badge.overdue { background: var(--brick-soft); color: var(--brick); }
-.ico-house { vertical-align: -2px; flex: none; }
-.tabbar-ico .ico-house { vertical-align: -3px; }
-.seg-btn .ico-house { vertical-align: -2px; margin-right: 2px; }
+.ico-house, .ico-inline { vertical-align: -2px; flex: none; }
+.tabbar-ico .ico-house, .tabbar-ico .ico-inline { vertical-align: -3px; }
+.seg-btn .ico-house, .seg-btn .ico-inline { vertical-align: -2px; margin-right: 2px; }
 
 /* ── Lending ──────────────────────────────────────────────── */
 .tx-row.settled { opacity: .55; }

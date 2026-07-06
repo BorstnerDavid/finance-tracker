@@ -44,9 +44,12 @@ const DEFAULT_CATEGORIES = {
 const CAT_COLORS = ['#2F5D50', '#C98A2D', '#B0492F', '#5B7FA6', '#8A6FA8', '#6E8B5E', '#C2607E', '#7A6A55', '#4A8B8B', '#A8842F'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-// Small inline "house" glyph for Household — the ⌂ Unicode character renders
-// inconsistently (missing/mismatched across fonts), so draw a matching line icon instead.
+// Small inline icon glyphs — plain Unicode dingbats (⌂ ⟳ ▣ …) render inconsistently
+// across fonts/platforms, so these draw matching line icons instead, sized to sit
+// inline with text via CSS (see .ico-* rules).
 const houseIcon = (size = 13) => `<svg class="ico-house" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10.5V20a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-9.5"/><path d="M10 21v-6h4v6"/></svg>`;
+const recurringIcon = (size = 13) => `<svg class="ico-inline" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v4.6h4.6"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-4.6h-4.6"/></svg>`;
+const projectIcon = (size = 13) => `<svg class="ico-inline" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>`;
 
 // ─── State ───────────────────────────────────────────────────
 const S = {
@@ -87,6 +90,10 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const cents = (n) => Math.round(Number(n) * 100);
 const sum = (arr) => arr.reduce((a, b) => a + cents(b.amount), 0) / 100;
+// Amount fields are plain text inputs (not type="number") because some mobile keyboards
+// send "," as the decimal separator, which <input type="number"> silently rejects.
+// This normalizes either separator before parsing.
+const parseAmount = (v) => Number(String(v ?? '').trim().replace(',', '.'));
 
 function fmt(n, withSign = false) {
   const v = Number(n) || 0;
@@ -667,7 +674,7 @@ function openDetailsModal(title, list) {
           <span class="tx-title">${esc(e.note || e.subcategory || e.category)}</span>
           <span class="tx-sub">${esc(e.date)}${e.subcategory ? ' · ' + esc(e.subcategory) : ''}</span>
         </span>
-        ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">⟳ ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
+        ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">${recurringIcon(11)} ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
         ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)}</span>` : ''}
         <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('') || '<div class="empty">No entries.</div>'}
@@ -711,8 +718,8 @@ function renderTransactions() {
           <span class="tx-title">${esc(e.note || e.subcategory || e.category)}</span>
           <span class="tx-sub">${esc(e.category)}${e.subcategory ? ' · ' + esc(e.subcategory) : ''}</span>
         </span>
-        ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">⟳ ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
-        ${e.source === 'project' ? '<span class="badge">▣ project</span>' : ''}
+        ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">${recurringIcon(11)} ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
+        ${e.source === 'project' ? `<span class="badge">${projectIcon(11)} project</span>` : ''}
         ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)} household</span>` : ''}
         <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('');
@@ -787,15 +794,21 @@ function renderRecurring() {
     const nOvr = Object.keys(r.overrides || {}).length;
     const early = canTriggerEarly(r);
     return `<div class="tx-row ${r.type}" data-recid="${esc(r.id)}" data-recscope="${r.scope}" role="button" tabindex="0">
-      <span class="tx-dot">⟳</span>
-      <span class="tx-main">
-        <span class="tx-title">${esc(r.name)}</span>
-        <span class="tx-sub">${esc(r.category)}${r.subcategory ? ' · ' + esc(r.subcategory) : ''} · day ${r.day} · ${range}${nOvr ? ` · ${nOvr} adjusted month${nOvr === 1 ? '' : 's'}` : ''}</span>
-      </span>
-      ${badge}
-      ${r.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(r.addedBy))}">${houseIcon(11)} household</span>` : ''}
-      ${early ? `<button type="button" class="btn btn-sm" data-trigger="${esc(r.id)}" data-trigscope="${r.scope}" title="Move this month's charge to today instead of day ${r.day}">⚡ Trigger early</button>` : ''}
-      <span class="tx-amt">${r.type === 'income' ? '+' : '−'}${fmt(r.amount).replace('−', '')}/mo</span>
+      <span class="tx-dot">${recurringIcon(15)}</span>
+      <div class="rec-body">
+        <div class="rec-line1">
+          <span class="tx-main">
+            <span class="tx-title">${esc(r.name)}</span>
+            <span class="tx-sub">${esc(r.category)}${r.subcategory ? ' · ' + esc(r.subcategory) : ''} · day ${r.day} · ${range}${nOvr ? ` · ${nOvr} adjusted month${nOvr === 1 ? '' : 's'}` : ''}</span>
+          </span>
+          <span class="tx-amt">${r.type === 'income' ? '+' : '−'}${fmt(r.amount).replace('−', '')}/mo</span>
+        </div>
+        <div class="rec-line2">
+          ${badge}
+          ${r.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(r.addedBy))}">${houseIcon(11)} household</span>` : ''}
+          ${early ? `<button type="button" class="btn btn-sm" data-trigger="${esc(r.id)}" data-trigscope="${r.scope}" title="Move this month's charge to today instead of day ${r.day}">⚡ Trigger early</button>` : ''}
+        </div>
+      </div>
     </div>`;
   }).join('');
 
@@ -879,7 +892,7 @@ async function toggleChecklistItem(project, itemId, checked) {
 }
 
 async function addChecklistItem(project, name, estimate) {
-  const item = { id: genId(), name, estimate: Math.round((Number(estimate) || 0) * 100) / 100, expenseId: null };
+  const item = { id: genId(), name, estimate: Math.round((parseAmount(estimate) || 0) * 100) / 100, expenseId: null };
   await updateDoc(scopedDoc(project.scope, 'projects', project.id), { checklist: [...(project.checklist || []), item] });
 }
 
@@ -920,7 +933,7 @@ function renderProjects() {
     const estTotal = items.reduce((a, i) => a + (Number(i.estimate) || 0), 0);
     const addRow = `<div class="settings-row cl-add-row">
       <input type="text" class="cl-name-input" data-projid="${esc(p.id)}" placeholder="Item name" maxlength="60">
-      <input type="number" class="cl-est-input" data-projid="${esc(p.id)}" placeholder="Est. €" step="0.01" min="0">
+      <input type="text" inputmode="decimal" autocomplete="off" class="cl-est-input" data-projid="${esc(p.id)}" placeholder="Est. €">
       <button type="button" class="btn btn-sm" data-addcl="${esc(p.id)}" data-projscope="${p.scope}">+ Add item</button>
     </div>`;
     const checklistBlock = clIsOpen ? `
@@ -1100,7 +1113,7 @@ $('loan-form').addEventListener('submit', async (e) => {
   const data = {
     direction: loanDir,
     person: $('loan-person').value.trim(),
-    amount: Math.round(Number($('loan-amount').value) * 100) / 100,
+    amount: Math.round(parseAmount($('loan-amount').value) * 100) / 100,
     date: $('loan-date').value,
     dueDate: $('loan-due').value || null,
     note: $('loan-note').value.trim(),
@@ -1142,9 +1155,9 @@ function renderInvestments() {
     const n = i + 1;
     return `<tr>
       <td>${m}</td>
-      <td><input class="inv-in mono" data-m="${n}" data-k="start" type="number" step="0.01" value="${get(n, 'start') || ''}" placeholder="—"></td>
-      <td><input class="inv-in mono" data-m="${n}" data-k="invested" type="number" step="0.01" value="${get(n, 'invested') || ''}" placeholder="—"></td>
-      <td><input class="inv-in mono" data-m="${n}" data-k="pl" type="number" step="0.01" value="${get(n, 'pl') || ''}" placeholder="—"></td>
+      <td><input class="inv-in mono" data-m="${n}" data-k="start" type="text" inputmode="decimal" autocomplete="off" value="${get(n, 'start') || ''}" placeholder="—"></td>
+      <td><input class="inv-in mono" data-m="${n}" data-k="invested" type="text" inputmode="decimal" autocomplete="off" value="${get(n, 'invested') || ''}" placeholder="—"></td>
+      <td><input class="inv-in mono" data-m="${n}" data-k="pl" type="text" inputmode="decimal" autocomplete="off" value="${get(n, 'pl') || ''}" placeholder="—"></td>
       <td class="mono">${fmt0(get(n, 'start') + get(n, 'invested') + get(n, 'pl'))}</td>
     </tr>`;
   }).join('');
@@ -1172,7 +1185,7 @@ function renderInvestments() {
     input.onchange = async () => {
       const m = input.dataset.m, k = input.dataset.k;
       const months = { ...S.investments };
-      months[m] = { ...(months[m] || {}), [k]: Number(input.value) || 0 };
+      months[m] = { ...(months[m] || {}), [k]: parseAmount(input.value) || 0 };
       await setDoc(userDoc('investments', String(S.year)), { months }, { merge: true });
       toast('Saved');
     };
@@ -1330,7 +1343,7 @@ function renderSettings() {
       <div class="settings-row">
         <label class="field" style="margin:0">
           <span>Starting balance for the year (${S.settings.currency})</span>
-          <input type="number" id="set-start" step="0.01" value="${S.settings.startingBalance}">
+          <input type="text" id="set-start" inputmode="decimal" autocomplete="off" value="${S.settings.startingBalance}">
         </label>
         <label class="field" style="margin:0;max-width:110px">
           <span>Currency</span>
@@ -1409,7 +1422,7 @@ function renderSettings() {
 
   $('set-save').onclick = async () => {
     await updateDoc(userDoc('meta', 'settings'), {
-      startingBalance: Number($('set-start').value) || 0,
+      startingBalance: parseAmount($('set-start').value) || 0,
       currency: $('set-cur').value.trim() || '€',
     });
     toast('Settings saved');
@@ -1869,7 +1882,7 @@ $('tx-form').addEventListener('submit', async (e) => {
   const scope = wasEditing ? S.editingTx.scope : txScope;
   const data = {
     type: txType,
-    amount: Math.round(Number($('tx-amount').value) * 100) / 100,
+    amount: Math.round(parseAmount($('tx-amount').value) * 100) / 100,
     date: $('tx-date').value,
     category: $('tx-category').value,
     subcategory: $('tx-subcategory').value || '',
@@ -1959,7 +1972,7 @@ $('rec-form').addEventListener('submit', async (e) => {
   const data = {
     type: recType,
     name: $('rec-name').value.trim(),
-    amount: Math.round(Number($('rec-amount').value) * 100) / 100,
+    amount: Math.round(parseAmount($('rec-amount').value) * 100) / 100,
     day: Math.min(31, Math.max(1, Number($('rec-day').value) || 1)),
     category: $('rec-category').value,
     subcategory: $('rec-subcategory').value || '',
@@ -2012,7 +2025,8 @@ $('project-form').addEventListener('submit', async (e) => {
   if (!name) return;
   const data = {
     name,
-    budget: $('project-budget').value ? Math.round(Number($('project-budget').value) * 100) / 100 : null,
+    budget: $('project-budget').value && Number.isFinite(parseAmount($('project-budget').value))
+      ? Math.round(parseAmount($('project-budget').value) * 100) / 100 : null,
     note: $('project-note').value.trim(),
   };
   const editing = S.editingProject;
@@ -2070,7 +2084,7 @@ $('pexp-form').addEventListener('submit', async (e) => {
   const { project, expense } = S.editingPexp;
   const data = {
     type: 'expense',
-    amount: Math.round(Number($('pexp-amount').value) * 100) / 100,
+    amount: Math.round(parseAmount($('pexp-amount').value) * 100) / 100,
     date: $('pexp-date').value,
     category: 'Projects',
     subcategory: project.name,
@@ -2126,7 +2140,7 @@ async function saveOverride(patch) {
 
 $('ovr-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const amount = Math.round(Number($('ovr-amount').value) * 100) / 100;
+  const amount = Math.round(parseAmount($('ovr-amount').value) * 100) / 100;
   const day = Math.min(31, Math.max(1, Number($('ovr-day').value) || 1));
   if (!amount) return;
   await saveOverride({ amount, day });
