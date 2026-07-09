@@ -24,6 +24,8 @@ A personal finance web app built to replace the `Finance_2026` Excel workbook. H
   - Investments and Excel/Revolut imports stay personal-only (not shared) to keep those simple.
   - Leaving a household only removes shared entries from your view; your personal data is untouched. The household's owner can delete it outright, which removes the shared data for everyone.
   - Household projects get their own grid on Overview ("⌂ Household projects"), separate from your personal "Expenses by category" table, so the two don't blend together.
+  - A project's Personal/Household scope can be changed after creation too — switching moves it (and everything logged against it) between the two pools.
+  - **Splitting who paid what**: a household transaction or project expense can be split across members instead of hitting everyone's numbers at full value. New entries default to an equal split (editable per entry); each member's Overview, category breakdown, and Entries totals only count *their own* share — not the full amount — so one person's €900 doesn't show up as -€900 for every member. The Projects tab itself still shows true project totals against budget, since that's about the project's real cost, not any one person's share.
 - **Drill-down details** — tap any amount in Overview's Monthly summary or Expenses by category tables to see exactly which transactions make it up. Tapping one of those opens it for editing.
 - **Trigger recurring entries early** — if today is before a rule's usual day this month, its Recurring row shows a "⚡ Trigger early" button: it moves just this month's charge to today (handy for "the rent actually went out early this time"). Next month it's back to the normal day automatically — this is a one-off adjustment, not a change to the rule itself.
 - **Lending reminders** — a separate Lending tab tracks money lent to or borrowed from someone (person, amount, optional due date), with overdue flags and a settled/unsettled toggle. Kept out of the main ledger entirely so IOUs don't affect your income/expense totals. Personal only (not shared with a household).
@@ -113,7 +115,7 @@ users/{uid}/
   meta/bank           { requisitionId, institutionName, lastSync }   // only with live sync
 
 households/{id}       { name, ownerUid, members: [uid, ...], memberNames: {uid: email} }
-  transactions/{id}   { …same shape as above, plus addedBy: uid }
+  transactions/{id}   { …same shape as above, plus addedBy: uid, payers?: {uid: amount} }  // payers = who paid what of the total
   recurring/{id}      { …same shape as above, plus addedBy: uid }
   projects/{id}       { …same shape as above, plus addedBy: uid }
 ```

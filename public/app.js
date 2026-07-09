@@ -360,12 +360,105 @@ function allEntries() {
 // (visible in Entries) but excluded from every expense sum.
 function countsAsExpense(e) { return e.type === 'expense' && e.category !== 'Investment'; }
 
+// ─── Household expense splitting ──────────────────────────────
+// A household entry's full amount only ever hit ONE shared total before — meaning
+// every member's personal net savings/ending balance took the full hit, regardless
+// of who actually paid. `payers` ({uid: amount}) fixes that: everywhere on Overview
+// (and Entries' totals) now uses each viewer's own share, not the shared total.
+function memberUids() { return S.household ? (S.household.members || []) : []; }
+
+function equalSplit(amount, uids) {
+  const n = uids.length || 1;
+  const payers = {};
+  let allocated = 0;
+  uids.forEach((uid, i) => {
+    if (i === uids.length - 1) {
+      payers[uid] = Math.round((amount - allocated) * 100) / 100;
+    } else {
+      const share = Math.floor((amount / n) * 100) / 100;
+      payers[uid] = share;
+      allocated = Math.round((allocated + share) * 100) / 100;
+    }
+  });
+  return payers;
+}
+
+// What the CURRENT user personally owes/paid for an entry. Personal entries are
+// always fully yours. Household entries use their `payers` map; older household
+// entries saved before this feature existed have no `payers` field, so they fall
+// back to "whoever added it paid all of it" (the de facto behavior beforehand).
+function myShare(e) {
+  if (e.scope !== 'household') return Number(e.amount) || 0;
+  if (e.payers && typeof e.payers === 'object') return Number(e.payers[S.user.uid]) || 0;
+  return e.addedBy === S.user.uid ? (Number(e.amount) || 0) : 0;
+}
+
+const sumShares = (arr) => arr.reduce((a, e) => a + cents(myShare(e)), 0) / 100;
+
+// Wires up the reusable "Split between household members" box shared by the
+// transaction and project-expense modals. `getAmount` reads the modal's live
+// amount field so "Split equally" always divides the current total.
+function renderSplitBox(prefix, getAmount, existingPayers) {
+  const box = $(`${prefix}-split-box`);
+  const rows = $(`${prefix}-split-rows`);
+  if (!S.household) { box.classList.add('hidden'); rows.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  const uids = memberUids();
+  const amount = getAmount();
+  const payers = (existingPayers && Object.keys(existingPayers).length) ? existingPayers : equalSplit(amount, uids);
+  rows.innerHTML = uids.map((uid) => {
+    const label = uid === S.user.uid ? 'You' : memberLabel(uid);
+    return `<div class="split-row">
+      <span class="split-name">${esc(label)}</span>
+      <input type="text" inputmode="decimal" autocomplete="off" class="split-amt" data-uid="${esc(uid)}" value="${(Number(payers[uid]) || 0).toFixed(2)}">
+    </div>`;
+  }).join('');
+  rows.querySelectorAll('.split-amt').forEach((inp) => inp.oninput = () => updateSplitTotal(prefix, getAmount()));
+  updateSplitTotal(prefix, amount);
+}
+
+function readSplitBox(prefix) {
+  const payers = {};
+  $(`${prefix}-split-rows`).querySelectorAll('.split-amt').forEach((inp) => {
+    payers[inp.dataset.uid] = Math.round((parseAmount(inp.value) || 0) * 100) / 100;
+  });
+  return payers;
+}
+
+function updateSplitTotal(prefix, amount) {
+  const el = $(`${prefix}-split-total`);
+  const payers = readSplitBox(prefix);
+  const total = Object.values(payers).reduce((a, v) => a + (Number(v) || 0), 0);
+  const diff = Math.round((total - amount) * 100) / 100;
+  el.textContent = diff === 0
+    ? `Splits ${fmt0(total)} of ${fmt0(amount)} ${S.settings.currency} — matches.`
+    : `Splits ${fmt0(total)} of ${fmt0(amount)} ${S.settings.currency} — ${diff > 0 ? 'over' : 'short'} by ${fmt0(Math.abs(diff))}.`;
+  el.classList.toggle('mismatch', diff !== 0);
+}
+
+// Returns null (valid, personal or no split needed) or a payers map; throws-by-toast
+// and returns undefined if a household split doesn't add up to the total.
+function collectPayers(prefix, scope, amount) {
+  if (scope !== 'household') return null;
+  const payers = readSplitBox(prefix);
+  const total = Object.values(payers).reduce((a, v) => a + (Number(v) || 0), 0);
+  if (Math.round((total - amount) * 100) / 100 !== 0) {
+    toast('The split doesn\'t add up to the total — adjust it or tap "Split equally".');
+    return undefined;
+  }
+  return payers;
+}
+
+// NOTE: every aggregation below uses myShare(e), not e.amount — Overview and Entries'
+// totals are each viewer's personal financial picture, so a shared household expense
+// only counts here to the extent it was actually assigned to the current user (see
+// the "Household expense splitting" section above).
 function monthlyTotals(entries, type) {
   const totals = Array(12).fill(0);
   for (const e of entries) {
     if (e.type !== type) continue;
     if (type === 'expense' && !countsAsExpense(e)) continue;
-    totals[Number(e.date.slice(5, 7)) - 1] += cents(e.amount);
+    totals[Number(e.date.slice(5, 7)) - 1] += cents(myShare(e));
   }
   return totals.map((c) => c / 100);
 }
@@ -378,12 +471,13 @@ function byCategory(entries, type) {
     const cat = e.category || 'Other';
     if (!map[cat]) map[cat] = { total: 0, months: Array(12).fill(0), subs: {} };
     const m = Number(e.date.slice(5, 7)) - 1;
-    map[cat].total += cents(e.amount);
-    map[cat].months[m] += cents(e.amount);
+    const share = cents(myShare(e));
+    map[cat].total += share;
+    map[cat].months[m] += share;
     const sub = e.subcategory || '—';
     if (!map[cat].subs[sub]) map[cat].subs[sub] = { total: 0, months: Array(12).fill(0) };
-    map[cat].subs[sub].total += cents(e.amount);
-    map[cat].subs[sub].months[m] += cents(e.amount);
+    map[cat].subs[sub].total += share;
+    map[cat].subs[sub].months[m] += share;
   }
   for (const c of Object.values(map)) {
     c.total /= 100;
@@ -405,8 +499,9 @@ function byHouseholdProject(entries) {
     const name = e.subcategory || 'Other';
     if (!map[name]) map[name] = { total: 0, months: Array(12).fill(0), subs: {} };
     const m = Number(e.date.slice(5, 7)) - 1;
-    map[name].total += cents(e.amount);
-    map[name].months[m] += cents(e.amount);
+    const share = cents(myShare(e));
+    map[name].total += share;
+    map[name].months[m] += share;
   }
   for (const c of Object.values(map)) {
     c.total /= 100;
@@ -663,10 +758,11 @@ function openEntryModal(e) {
 
 function openDetailsModal(title, list) {
   const sorted = [...list].sort((a, b) => b.date.localeCompare(a.date));
-  const total = sum(sorted);
+  const total = sumShares(sorted);
+  const hasHousehold = sorted.some((e) => e.scope === 'household');
   $('details-title').textContent = title;
   $('details-body').innerHTML = `
-    <p class="hint" style="margin:-4px 0 14px">${sorted.length} entr${sorted.length === 1 ? 'y' : 'ies'} · total ${fmt(total)}</p>
+    <p class="hint" style="margin:-4px 0 14px">${sorted.length} entr${sorted.length === 1 ? 'y' : 'ies'} · your share ${fmt(total)}${hasHousehold ? ' (household entries split by payer)' : ''}</p>
     ${sorted.map((e) => `
       <button class="tx-row ${e.type}" data-txid="${esc(e.id)}">
         <span class="tx-dot">${e.type === 'income' ? '↑' : '↓'}</span>
@@ -675,7 +771,7 @@ function openDetailsModal(title, list) {
           <span class="tx-sub">${esc(e.date)}${e.subcategory ? ' · ' + esc(e.subcategory) : ''}</span>
         </span>
         ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">${recurringIcon(11)} ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
-        ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)}</span>` : ''}
+        ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)} ${myShare(e) === Number(e.amount) ? 'household' : `your share ${fmt0(myShare(e))}`}</span>` : ''}
         <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('') || '<div class="empty">No entries.</div>'}
   `;
@@ -700,8 +796,8 @@ function renderTransactions() {
     (e.subcategory || '').toLowerCase().includes(q));
   list.sort((a, b) => b.date.localeCompare(a.date));
 
-  const totInc = sum(list.filter((e) => e.type === 'income'));
-  const totExp = sum(list.filter(countsAsExpense));
+  const totInc = sumShares(list.filter((e) => e.type === 'income'));
+  const totExp = sumShares(list.filter(countsAsExpense));
 
   // group by date
   const groups = {};
@@ -720,7 +816,7 @@ function renderTransactions() {
         </span>
         ${e.virtual ? `<span class="badge ${e.adjusted ? 'adjusted' : ''}">${recurringIcon(11)} ${e.adjusted ? 'adjusted' : 'recurring'}</span>` : ''}
         ${e.source === 'project' ? `<span class="badge">${projectIcon(11)} project</span>` : ''}
-        ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)} household</span>` : ''}
+        ${e.scope === 'household' ? `<span class="badge household" title="Added by ${esc(memberLabel(e.addedBy))}">${houseIcon(11)} ${myShare(e) === Number(e.amount) ? 'household' : `your share ${fmt0(myShare(e))}`}</span>` : ''}
         <span class="tx-amt">${e.type === 'income' ? '+' : '−'}${fmt(e.amount).replace('−', '')}</span>
       </button>`).join('');
     return `<div class="day-group"><div class="day-head">${head}</div>${items}</div>`;
@@ -817,7 +913,7 @@ function renderRecurring() {
     ...expandRecurring(now.getFullYear(), S.recurring),
     ...expandRecurring(now.getFullYear(), S.householdRecurring),
   ].filter((e) => e.type === 'expense' && e.monthKey === nowKey);
-  const monthlyLoad = sum(thisMonthInstances);
+  const monthlyLoad = sumShares(thisMonthInstances);
 
   el.innerHTML = `
     <h1>Recurring</h1>
@@ -857,6 +953,56 @@ function projectExpensesFor(project) {
   return list.filter((e) => e.projectId === project.id);
 }
 
+// Moves a project (and everything logged against it) between the personal and
+// household pools. Since the two live in entirely separate Firestore collections,
+// "moving" means: copy the expenses to new docs in the target pool, remap the
+// checklist's expenseId references to those new docs, create the project there,
+// then delete the old copies — in that order, so a failure partway through never
+// loses data. `updatedFields` lets a scope change and a normal edit (name/budget/
+// note) land in the same save instead of two separate writes.
+async function changeProjectScope(project, newScope, updatedFields = {}) {
+  const linked = projectExpensesFor(project);
+  const { id, scope, ...projData } = project;
+  const newProjData = { ...projData, ...updatedFields };
+  const destRefs = linked.map(() => doc(scopedCol(newScope, 'transactions')));
+  const idMap = {};
+
+  for (let i = 0; i < linked.length; i += 400) {
+    const b = writeBatch(db);
+    for (let j = i; j < Math.min(i + 400, linked.length); j++) {
+      const { id: eid, scope: escope, ...expData } = linked[j];
+      expData.subcategory = newProjData.name;
+      if (newScope === 'household') {
+        expData.addedBy = expData.addedBy || S.user.uid;
+        // Moving personal → household: nobody has paid-shares yet, so start equal.
+        if (!expData.payers) expData.payers = equalSplit(Number(expData.amount) || 0, memberUids());
+      } else {
+        delete expData.addedBy;
+        delete expData.payers;
+      }
+      b.set(destRefs[j], expData);
+    }
+    await b.commit();
+  }
+  linked.forEach((e, j) => { idMap[e.id] = destRefs[j].id; });
+
+  const newChecklist = (newProjData.checklist || []).map((item) => ({
+    ...item,
+    expenseId: item.expenseId ? (idMap[item.expenseId] || null) : null,
+  }));
+  if (newScope === 'household') newProjData.addedBy = S.user.uid; else delete newProjData.addedBy;
+  const newProjRef = await addDoc(scopedCol(newScope, 'projects'), { ...newProjData, checklist: newChecklist });
+
+  for (let i = 0; i < linked.length; i += 400) {
+    const b = writeBatch(db);
+    for (let j = i; j < Math.min(i + 400, linked.length); j++) b.delete(scopedDoc(project.scope, 'transactions', linked[j].id));
+    await b.commit();
+  }
+  await deleteDoc(scopedDoc(project.scope, 'projects', project.id));
+
+  return { id: newProjRef.id, scope: newScope };
+}
+
 // A checklist item is { id, name, estimate, expenseId }. It's "checked" iff expenseId
 // still resolves to a live expense — so deleting that expense from the Expenses list
 // automatically shows the item as unchecked again, instead of drifting out of sync.
@@ -881,7 +1027,10 @@ async function toggleChecklistItem(project, itemId, checked) {
       source: 'project',
       projectId: project.id,
     };
-    if (project.scope === 'household') data.addedBy = S.user.uid;
+    if (project.scope === 'household') {
+      data.addedBy = S.user.uid;
+      data.payers = equalSplit(data.amount, memberUids());
+    }
     const ref = await addDoc(scopedCol(project.scope, 'transactions'), data);
     next[idx] = { ...item, expenseId: ref.id };
   } else {
@@ -1861,6 +2010,8 @@ function openTxModal(tx = null) {
   document.querySelectorAll('[data-txtype]').forEach((b) =>
     b.classList.toggle('active', b.dataset.txtype === txType));
   fillCategorySelects('tx', txType, tx?.category, tx?.subcategory);
+  if (txScope === 'household') renderSplitBox('tx', () => parseAmount($('tx-amount').value) || 0, tx?.payers);
+  else $('tx-split-box').classList.add('hidden');
   $('tx-modal').classList.remove('hidden');
   setTimeout(() => $('tx-amount').focus(), 50);
 }
@@ -1874,7 +2025,17 @@ document.querySelectorAll('[data-txtype]').forEach((b) => b.addEventListener('cl
 document.querySelectorAll('[data-txscope]').forEach((b) => b.addEventListener('click', () => {
   txScope = b.dataset.txscope;
   document.querySelectorAll('[data-txscope]').forEach((x) => x.classList.toggle('active', x === b));
+  if (txScope === 'household') renderSplitBox('tx', () => parseAmount($('tx-amount').value) || 0, null);
+  else $('tx-split-box').classList.add('hidden');
 }));
+
+$('tx-amount').addEventListener('input', () => {
+  if (!$('tx-split-box').classList.contains('hidden')) updateSplitTotal('tx', parseAmount($('tx-amount').value) || 0);
+});
+
+$('tx-split-equal').addEventListener('click', () => {
+  renderSplitBox('tx', () => parseAmount($('tx-amount').value) || 0, null);
+});
 
 $('tx-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1889,6 +2050,9 @@ $('tx-form').addEventListener('submit', async (e) => {
     note: $('tx-note').value.trim(),
   };
   if (!data.amount || !data.date) return;
+  const payers = collectPayers('tx', scope, data.amount);
+  if (payers === undefined) return;
+  if (payers) data.payers = payers;
   if (!wasEditing && scope === 'household') data.addedBy = S.user.uid;
   try {
     if (wasEditing) await updateDoc(scopedDoc(scope, 'transactions', S.editingTx.id), data);
@@ -2000,9 +2164,31 @@ $('rec-delete').addEventListener('click', async () => {
 // ═══════════════ PROJECT MODAL ═══════════════
 let projectScope = 'personal';
 
+// Unlike the transaction/recurring scope toggle, a project's Personal/Household
+// choice stays editable after creation — the toggle is only hidden if there's no
+// household to move it into or out of.
+function setupProjectScopeUI(project) {
+  const row = $('project-scope-row');
+  const hint = $('project-scope-hint');
+  const current = project?.scope || 'personal';
+  if (project?.scope === 'household' && project.addedBy) {
+    hint.innerHTML = `${houseIcon(11)} Added by ${esc(memberLabel(project.addedBy))}.`;
+    hint.classList.remove('hidden');
+  } else {
+    hint.classList.add('hidden');
+  }
+  if (S.household) {
+    row.classList.remove('hidden');
+    row.querySelectorAll('.seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.projscope === current));
+    return current;
+  }
+  row.classList.add('hidden');
+  return current;
+}
+
 function openProjectModal(project = null) {
   S.editingProject = project;
-  projectScope = setupScopeUI('project', project, 'personal');
+  projectScope = setupProjectScopeUI(project);
   $('project-modal-title').textContent = project ? 'Edit project' : 'New project';
   $('project-delete').classList.toggle('hidden', !project);
   $('project-name').value = project?.name || '';
@@ -2030,26 +2216,35 @@ $('project-form').addEventListener('submit', async (e) => {
     note: $('project-note').value.trim(),
   };
   const editing = S.editingProject;
-  const scope = editing ? editing.scope : projectScope;
   try {
     if (editing) {
       data.archived = !!editing.archived;
-      await updateDoc(scopedDoc(scope, 'projects', editing.id), data);
-      if (editing.name !== name) {
-        const linked = projectExpensesFor(editing);
-        for (let i = 0; i < linked.length; i += 400) {
-          const b = writeBatch(db);
-          linked.slice(i, i + 400).forEach((e2) => b.update(scopedDoc(scope, 'transactions', e2.id), { subcategory: name }));
-          await b.commit();
+      if (projectScope !== editing.scope) {
+        const msg = projectScope === 'household'
+          ? `Share “${editing.name}” with your household? Everyone in ${S.household ? `“${S.household.name}”` : 'your household'} will be able to see, edit, and add expenses to it.`
+          : `Make “${editing.name}” personal again? It will no longer be visible to your household.`;
+        if (!confirm(msg)) return;
+        await changeProjectScope(editing, projectScope, data);
+        toast('Project moved and updated');
+      } else {
+        await updateDoc(scopedDoc(editing.scope, 'projects', editing.id), data);
+        if (editing.name !== name) {
+          const linked = projectExpensesFor(editing);
+          for (let i = 0; i < linked.length; i += 400) {
+            const b = writeBatch(db);
+            linked.slice(i, i + 400).forEach((e2) => b.update(scopedDoc(editing.scope, 'transactions', e2.id), { subcategory: name }));
+            await b.commit();
+          }
         }
+        toast('Project updated');
       }
     } else {
-      if (scope === 'household') data.addedBy = S.user.uid;
-      await addDoc(scopedCol(scope, 'projects'), { ...data, archived: false, checklist: [] });
+      if (projectScope === 'household') data.addedBy = S.user.uid;
+      await addDoc(scopedCol(projectScope, 'projects'), { ...data, archived: false, checklist: [] });
+      toast('Project created');
     }
     closeModal('project-modal');
-    toast(editing ? 'Project updated' : 'Project created');
-  } catch { toast('Could not save — check your connection'); }
+  } catch (ex) { console.error(ex); toast('Could not save — check your connection'); }
 });
 
 $('project-delete').addEventListener('click', async () => {
@@ -2075,9 +2270,19 @@ function openPexpModal(project, expense = null) {
   $('pexp-amount').value = expense?.amount ?? '';
   $('pexp-date').value = expense?.date || todayStr();
   $('pexp-note').value = expense?.note || '';
+  if (project.scope === 'household') renderSplitBox('pexp', () => parseAmount($('pexp-amount').value) || 0, expense?.payers);
+  else $('pexp-split-box').classList.add('hidden');
   $('pexp-modal').classList.remove('hidden');
   setTimeout(() => $('pexp-amount').focus(), 50);
 }
+
+$('pexp-amount').addEventListener('input', () => {
+  if (!$('pexp-split-box').classList.contains('hidden')) updateSplitTotal('pexp', parseAmount($('pexp-amount').value) || 0);
+});
+
+$('pexp-split-equal').addEventListener('click', () => {
+  renderSplitBox('pexp', () => parseAmount($('pexp-amount').value) || 0, null);
+});
 
 $('pexp-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -2093,6 +2298,9 @@ $('pexp-form').addEventListener('submit', async (e) => {
     projectId: project.id,
   };
   if (!data.amount || !data.date) return;
+  const payers = collectPayers('pexp', project.scope, data.amount);
+  if (payers === undefined) return;
+  if (payers) data.payers = payers;
   if (!expense && project.scope === 'household') data.addedBy = S.user.uid;
   try {
     if (expense) await updateDoc(scopedDoc(project.scope, 'transactions', expense.id), data);

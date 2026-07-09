@@ -111,6 +111,12 @@
         <span>Amount (€)</span>
         <input type="text" id="tx-amount" inputmode="decimal" autocomplete="off" required>
       </label>
+      <div class="field hidden" id="tx-split-box">
+        <span>Split between household members</span>
+        <div class="split-rows" id="tx-split-rows"></div>
+        <div class="split-total" id="tx-split-total"></div>
+        <button type="button" class="btn btn-sm" id="tx-split-equal" style="margin-top:8px">Split equally</button>
+      </div>
       <label class="field">
         <span>Date</span>
         <input type="date" id="tx-date" required>
@@ -326,6 +332,12 @@
         <span>Amount (€)</span>
         <input type="text" id="pexp-amount" inputmode="decimal" autocomplete="off" required>
       </label>
+      <div class="field hidden" id="pexp-split-box">
+        <span>Split between household members</span>
+        <div class="split-rows" id="pexp-split-rows"></div>
+        <div class="split-total" id="pexp-split-total"></div>
+        <button type="button" class="btn btn-sm" id="pexp-split-equal" style="margin-top:8px">Split equally</button>
+      </div>
       <label class="field">
         <span>Date</span>
         <input type="date" id="pexp-date" required>
